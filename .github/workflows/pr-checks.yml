@@ -1,12 +1,15 @@
 # ── PR Checks — Forecast Studio ─────────────────────────────────────────────
+# Runs on pull requests and on every push to main/develop (e.g. direct push to main).
 name: PR Checks
 
 on:
   pull_request:
     branches: [main, develop]
+  push:
+    branches: [main, develop]
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
