@@ -82,54 +82,16 @@ NEXT_PUBLIC_API_URL=http://localhost:8000 npm run dev
 
 ## Branch Strategy & CI/CD
 
-### Schemat
+### Automatyczny deploy (GitHub Actions)
 
-```
-develop  ──push──>  GitHub Actions  ──deploy──>  Azure DEV
-release/*──push──>  GitHub Actions  ──deploy──>  Azure TEST
-main     ──push──>  GitHub Actions  ──deploy──>  Azure PROD (wymaga approval)
-```
+**Wyłączony** — w repozytorium nie ma workflowu ciągłego wdrożenia na Azure; zakładany jest rozwój lokalny (`docker compose`, `make local-up`).
+**PR:** [`.github/workflows/pr-checks.yml`](.github/workflows/pr-checks.yml) (m.in. Ruff, testy backendu).
 
-### Branching model
+Wdrożenie na Azure wyłącznie **ręcznie**: [Ręczny deploy z CLI](#ręczny-deploy-z-cli) oraz `make infra-*` / `make deploy-*` w Makefile (wymaga `az` i skonfigurowanego ACR).
 
-```
-feature/xyz ──PR──> develop ──PR──> release/v1.0 ──PR──> main
-                      │                   │                │
-                      ▼                   ▼                ▼
-                  Azure DEV          Azure TEST        Azure PROD
-```
+### Opcjonalny model branchy (na przyszłość)
 
-### Pipeline CI/CD (`.github/workflows/deploy.yml`)
-
-Pipeline składa się z 6 jobów:
-
-1. **test-backend** — lint (ruff), type check (mypy), testy (pytest)
-2. **test-frontend** — lint (ESLint), type check (tsc), build
-3. **resolve-env** — mapowanie brancha na środowisko (dev/test/prod)
-4. **build-and-push** — buduje Docker images, pushuje do Azure Container Registry
-5. **deploy-infra** — deploy Bicep (tylko gdy zmienione pliki w `infra/`)
-6. **deploy-app** — deploy Container Apps + migracje
-
-### Workflow
-
-```bash
-# 1. Nowa funkcjonalność
-git checkout develop
-git checkout -b feature/my-feature
-# ... implementacja ...
-git push origin feature/my-feature
-# Stwórz PR do develop → po merge auto-deploy na DEV
-
-# 2. Release
-git checkout develop
-git checkout -b release/v1.0
-git push origin release/v1.0
-# Auto-deploy na TEST
-
-# 3. Production
-# Stwórz PR z release/v1.0 do main
-# Po merge → deploy na PROD (z ręcznym approval)
-```
+Jeśli kiedyś przywrócisz pipeline (np. własny workflow lub zewnętrzny runner), typowy podział to `develop` → DEV, `release/*` → TEST, `main` → PROD.
 
 ---
 
@@ -297,9 +259,7 @@ az containerapp revision restart \
 make status-dev
 ```
 
-### CI/CD
+### CI (PR checks)
 
-- **Pipeline failuje na `test-backend`** — sprawdź `ruff` / `mypy` / `pytest` lokalnie
-- **`deploy-infra` nie odpala** — job odpala się tylko gdy zmienione pliki w `infra/**`
-- **PROD nie deployuje** — sprawdź czy environment `prod` ma configured reviewers
-- **ACR push fails** — sprawdź czy `AZURE_CREDENTIALS` ma dostęp do ACR
+- **Fail na backendzie** — uruchom lokalnie: `cd backend && uv run ruff check app/ && uv run pytest tests/`
+- **Sekrety przy ręcznym `make deploy-*`** — `AZURE_CREDENTIALS`, `ACR_NAME` itd. muszą być dostępne w środowisku / skonfigurowane zgodnie z Makefile
