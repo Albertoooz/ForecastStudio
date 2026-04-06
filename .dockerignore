@@ -1,0 +1,14 @@
+.git
+.github
+**/.venv
+**/node_modules
+**/__pycache__
+*.pyc
+frontend/.next
+frontend/node_modules
+orchestration/.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+streamlit_logs.txt
+*.log

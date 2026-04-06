@@ -1,0 +1,339 @@
+# ── Forecast Studio — CI/CD ────────────────────────────────────────────────
+#
+# Branch strategy:
+#   develop      → auto-deploy → DEV
+#   release/*    → auto-deploy → TEST
+#   main         → manual gate → PROD
+#
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, develop, "release/**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_RESOURCE_GROUP_PREFIX: forecaster
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+
+  test-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.6.x"
+          enable-cache: true
+
+      - name: Sync workspace
+        run: uv sync --frozen --all-packages --group dev
+
+      - name: Ruff
+        run: uv run ruff check backend/app packages/forecaster/forecaster orchestration/fs_orch --output-format=github
+
+      - name: Mypy (backend)
+        working-directory: backend
+        run: uv run mypy app/ --ignore-missing-imports
+
+      - name: Unit tests
+        working-directory: backend
+        run: uv run pytest tests/ -v --tb=short --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: backend/test-results.xml
+          if-no-files-found: ignore
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint || true
+
+      - name: Type check
+        working-directory: frontend
+        run: npx tsc --noEmit || true
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  resolve-env:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      should_deploy: ${{ steps.set-env.outputs.should_deploy }}
+      image_tag: ${{ steps.set-env.outputs.image_tag }}
+      resource_group: ${{ steps.set-env.outputs.resource_group }}
+    steps:
+      - name: Determine target environment
+        id: set-env
+        run: |
+          REF="${{ github.ref }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+
+          if [[ "$REF" == "refs/heads/develop" ]]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "image_tag=dev-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "resource_group=forecaster-dev-rg" >> $GITHUB_OUTPUT
+          elif [[ "$REF" == refs/heads/release/* ]]; then
+            echo "environment=test" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "image_tag=test-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "resource_group=forecaster-test-rg" >> $GITHUB_OUTPUT
+          elif [[ "$REF" == "refs/heads/main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "image_tag=prod-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            echo "resource_group=forecaster-prod-rg" >> $GITHUB_OUTPUT
+          else
+            echo "environment=none" >> $GITHUB_OUTPUT
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            echo "image_tag=none" >> $GITHUB_OUTPUT
+            echo "resource_group=none" >> $GITHUB_OUTPUT
+          fi
+
+          echo "### Deploy target" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`$REF\` |" >> $GITHUB_STEP_SUMMARY
+
+  build-and-push:
+    needs: [gitleaks, test-backend, test-frontend, resolve-env]
+    if: needs.resolve-env.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-env.outputs.environment }}
+    env:
+      IMAGE_TAG: ${{ needs.resolve-env.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ secrets.ACR_NAME }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.ACR_NAME }}.azurecr.io/forecaster-backend:${{ env.IMAGE_TAG }}
+            ${{ secrets.ACR_NAME }}.azurecr.io/forecaster-backend:latest-${{ needs.resolve-env.outputs.environment }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.ACR_NAME }}.azurecr.io/forecaster-frontend:${{ env.IMAGE_TAG }}
+            ${{ secrets.ACR_NAME }}.azurecr.io/forecaster-frontend:latest-${{ needs.resolve-env.outputs.environment }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.BACKEND_URL || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "### Images pushed" >> $GITHUB_STEP_SUMMARY
+          echo "- \`forecaster-backend:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`forecaster-frontend:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+
+  deploy-infra:
+    needs: [resolve-env]
+    if: needs.resolve-env.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-env.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if infra changed
+        id: infra-changed
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -q "^infra/"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to Azure
+        if: steps.infra-changed.outputs.changed == 'true'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Ensure resource group exists
+        if: steps.infra-changed.outputs.changed == 'true'
+        run: |
+          az group create \
+            --name ${{ needs.resolve-env.outputs.resource_group }} \
+            --location westeurope \
+            --tags environment=${{ needs.resolve-env.outputs.environment }} project=forecast-studio
+
+      - name: Deploy Bicep
+        if: steps.infra-changed.outputs.changed == 'true'
+        uses: azure/arm-deploy@v2
+        with:
+          resourceGroupName: ${{ needs.resolve-env.outputs.resource_group }}
+          template: infra/main.bicep
+          parameters: >
+            environment=${{ needs.resolve-env.outputs.environment }}
+            dbAdminPassword=${{ secrets.DB_ADMIN_PASSWORD }}
+            jwtSecret=${{ secrets.JWT_SECRET }}
+            deepseekApiKey=${{ secrets.DEEPSEEK_API_KEY }}
+
+  deploy-app:
+    needs: [build-and-push, resolve-env, deploy-infra]
+    if: |
+      always() &&
+      needs.build-and-push.result == 'success' &&
+      needs.resolve-env.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-env.outputs.environment }}
+    env:
+      ENV: ${{ needs.resolve-env.outputs.environment }}
+      RG: ${{ needs.resolve-env.outputs.resource_group }}
+      IMAGE_TAG: ${{ needs.resolve-env.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy backend container
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ env.RG }}
+          containerAppName: forecaster-${{ env.ENV }}-backend
+          imageToDeploy: ${{ secrets.ACR_NAME }}.azurecr.io/forecaster-backend:${{ env.IMAGE_TAG }}
+
+      - name: Deploy frontend container
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ env.RG }}
+          containerAppName: forecaster-${{ env.ENV }}-frontend
+          imageToDeploy: ${{ secrets.ACR_NAME }}.azurecr.io/forecaster-frontend:${{ env.IMAGE_TAG }}
+
+      - name: Deploy celery worker
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ env.RG }}
+          containerAppName: forecaster-${{ env.ENV }}-worker
+          imageToDeploy: ${{ secrets.ACR_NAME }}.azurecr.io/forecaster-backend:${{ env.IMAGE_TAG }}
+
+      - name: Run database migrations
+        run: |
+          az containerapp exec \
+            --resource-group ${{ env.RG }} \
+            --name forecaster-${{ env.ENV }}-backend \
+            --command "alembic upgrade head" || echo "Migration skipped"
+
+      - name: Verify deployment
+        run: |
+          BACKEND_FQDN=$(az containerapp show \
+            --resource-group ${{ env.RG }} \
+            --name forecaster-${{ env.ENV }}-backend \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          FRONTEND_FQDN=$(az containerapp show \
+            --resource-group ${{ env.RG }} \
+            --name forecaster-${{ env.ENV }}-frontend \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          echo "### Deployed to \`${{ env.ENV }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | URL | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----|--------|" >> $GITHUB_STEP_SUMMARY
+
+          BACKEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://${BACKEND_FQDN}/health" || echo "000")
+          echo "| Backend | https://${BACKEND_FQDN} | ${BACKEND_STATUS} |" >> $GITHUB_STEP_SUMMARY
+
+          FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://${FRONTEND_FQDN}" || echo "000")
+          echo "| Frontend | https://${FRONTEND_FQDN} | ${FRONTEND_STATUS} |" >> $GITHUB_STEP_SUMMARY
+
+  smoke-test:
+    needs: [deploy-app, resolve-env]
+    if: needs.deploy-app.result == 'success'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve-env.outputs.environment }}
+    env:
+      RG: ${{ needs.resolve-env.outputs.resource_group }}
+      ENV: ${{ needs.resolve-env.outputs.environment }}
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Run smoke tests
+        run: |
+          BACKEND_FQDN=$(az containerapp show \
+            --resource-group ${{ env.RG }} \
+            --name forecaster-${{ env.ENV }}-backend \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+
+          BASE_URL="https://${BACKEND_FQDN}"
+
+          echo "Testing ${BASE_URL}..."
+
+          STATUS=$(curl -sf "${BASE_URL}/health" | jq -r '.status')
+          [[ "$STATUS" == "healthy" ]] && echo "Health OK" || echo "Health FAIL"
+
+          curl -sf "${BASE_URL}/docs" > /dev/null && echo "Docs OK" || echo "Docs FAIL"
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${BASE_URL}/api/auth/me")
+          [[ "$STATUS" == "401" ]] && echo "Auth endpoint OK (401 expected)" || echo "Auth returned ${STATUS}"

@@ -1,0 +1,34 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: debug-statements
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.9
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.11.3
+    hooks:
+      - id: uv-lock
+
+  - repo: local
+    hooks:
+      - id: mypy-backend
+        name: mypy (backend)
+        language: system
+        entry: bash -c 'cd "$(git rev-parse --show-toplevel)/backend" && uv run mypy app/ --ignore-missing-imports'
+        pass_filenames: false
+        always_run: true

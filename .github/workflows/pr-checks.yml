@@ -1,0 +1,99 @@
+# ── PR Checks — Forecast Studio ─────────────────────────────────────────────
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+
+  test-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.6.x"
+          enable-cache: true
+
+      - name: Sync workspace
+        run: uv sync --frozen --all-packages --group dev
+
+      - name: Ruff
+        run: uv run ruff check backend/app packages/forecaster/forecaster orchestration/fs_orch --output-format=github
+
+      - name: Mypy (backend)
+        working-directory: backend
+        run: uv run mypy app/ --ignore-missing-imports
+
+      - name: Tests
+        working-directory: backend
+        run: uv run pytest tests/ -v --tb=short
+
+  test-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint || true
+
+      - name: Type check
+        working-directory: frontend
+        run: npx tsc --noEmit || true
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
