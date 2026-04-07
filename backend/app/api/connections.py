@@ -5,7 +5,6 @@ Data connections API — PostgreSQL and other connectors; materialize snapshots 
 from datetime import datetime
 from uuid import UUID, uuid4
 
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -17,11 +16,39 @@ from app.connectors.registry import get_connector
 from app.db.models import DataSource, Dataset, User
 from app.db.session import get_db
 from app.storage.blob import get_blob_storage
+from forecaster.utils.tabular import schema_dtype_map
 
 router = APIRouter()
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
+
+
+class PreAggregateConfig(BaseModel):
+    """
+    Server-side pre-aggregation pushed down to Postgres.
+
+    Use this when the source table has millions of transactional rows that need
+    to be aggregated (e.g. daily sales) before being stored in the dataset.
+    Postgres does the GROUP BY so only the aggregated rows are transferred.
+    """
+
+    datetime_column: str = Field(..., description="Name of the timestamp/date column to group by")
+    target_columns: list[str] = Field(
+        ..., min_length=1, description="Columns to aggregate (e.g. ['revenue', 'quantity'])"
+    )
+    group_columns: list[str] = Field(
+        default_factory=list,
+        description="Additional GROUP BY columns (e.g. ['store_id', 'product_id'])",
+    )
+    frequency: str = Field(
+        "D",
+        description="Aggregation granularity: D=daily, W=weekly, M=monthly, H=hourly, Q=quarterly, Y=yearly",
+    )
+    aggregation: str = Field(
+        "sum",
+        description="Aggregation function: sum | mean | count | min | max",
+    )
 
 
 class PostgresConnectionBody(BaseModel):
@@ -32,6 +59,20 @@ class PostgresConnectionBody(BaseModel):
     password: str
     query: str | None = None
     table: str | None = None
+    row_limit: int | None = Field(
+        default=None,
+        description=(
+            "Maximum rows to load. Defaults to 1 000 000 as a safety cap. "
+            "Set to 0 to disable the limit (use with pre_aggregate for large tables)."
+        ),
+    )
+    pre_aggregate: PreAggregateConfig | None = Field(
+        default=None,
+        description=(
+            "Optional server-side aggregation. When set, Postgres performs the GROUP BY "
+            "before transferring data, drastically reducing rows for large transactional tables."
+        ),
+    )
 
 
 class ConnectionTestRequest(BaseModel):
@@ -56,7 +97,7 @@ class ConnectionCreateRequest(BaseModel):
 
 
 def _pg_to_config(pg: PostgresConnectionBody) -> dict:
-    return {
+    cfg: dict = {
         "host": pg.host,
         "port": pg.port,
         "database": pg.database,
@@ -65,6 +106,11 @@ def _pg_to_config(pg: PostgresConnectionBody) -> dict:
         "query": pg.query,
         "table": pg.table,
     }
+    if pg.row_limit is not None:
+        cfg["row_limit"] = pg.row_limit
+    if pg.pre_aggregate is not None:
+        cfg["pre_aggregate"] = pg.pre_aggregate.model_dump()
+    return cfg
 
 
 def _query_or_table_label(pg: PostgresConnectionBody) -> str:
@@ -123,12 +169,12 @@ async def probe_preview(
         df = conn.preview_table(cfg, body.table, limit=body.rows)
     except Exception as e:
         raise HTTPException(400, f"Preview failed: {e}") from e
-    head = df.where(pd.notnull(df), None).to_dict(orient="records")
+    head = df.head(body.rows).to_dicts()
     return {
         "columns": list(df.columns),
-        "dtypes": {c: str(t) for c, t in df.dtypes.items()},
+        "dtypes": {c: str(df[c].dtype) for c in df.columns},
         "head": head,
-        "shape": [len(df), len(df.columns)],
+        "shape": [df.height, df.width],
     }
 
 
@@ -161,16 +207,13 @@ async def create_connection(
 
     blob.upload_df("datasets", blob_path, df, fmt="parquet")
 
-    schema = {col: str(dtype) for col, dtype in df.dtypes.items()}
+    schema = schema_dtype_map(df)
     datetime_col = None
     for col in df.columns:
-        if "date" in col.lower() or "time" in col.lower() or col.lower() == "ds":
-            try:
-                pd.to_datetime(df[col].head(10))
-                datetime_col = col
-                break
-            except Exception:
-                pass
+        cl = col.lower()
+        if "date" in cl or "time" in cl or cl == "ds":
+            datetime_col = col
+            break
 
     if body.dataset_type and body.dataset_type == "future_variables":
         schema["__type__"] = "future_variables"
@@ -183,8 +226,8 @@ async def create_connection(
         blob_path=blob_path,
         file_type="parquet",
         schema_json=schema,
-        row_count=len(df),
-        column_count=len(df.columns),
+        row_count=df.height,
+        column_count=df.width,
         datetime_column=datetime_col,
     )
     db.add(dataset)
@@ -229,10 +272,10 @@ async def perform_data_source_sync(
         df = conn.fetch_data(cfg)
         blob = get_blob_storage()
         blob.upload_df("datasets", dataset.blob_path, df, fmt="parquet")
-        dataset.row_count = len(df)
-        dataset.column_count = len(df.columns)
+        dataset.row_count = df.height
+        dataset.column_count = df.width
         prev_type = (dataset.schema_json or {}).get("__type__", "training")
-        dataset.schema_json = {c: str(t) for c, t in df.dtypes.items()}
+        dataset.schema_json = schema_dtype_map(df)
         dataset.schema_json["__type__"] = prev_type
         dataset.file_type = "parquet"
         ds_row.last_sync_at = datetime.utcnow()
@@ -357,10 +400,10 @@ async def preview_saved(
         df = conn.preview_table(cfg, table, limit=lim)
     except Exception as e:
         raise HTTPException(400, str(e)) from e
-    head = df.where(pd.notnull(df), None).to_dict(orient="records")
+    head = df.head(lim).to_dicts()
     return {
         "columns": list(df.columns),
-        "dtypes": {c: str(t) for c, t in df.dtypes.items()},
+        "dtypes": {c: str(df[c].dtype) for c in df.columns},
         "head": head,
-        "shape": [len(df), len(df.columns)],
+        "shape": [df.height, df.width],
     }

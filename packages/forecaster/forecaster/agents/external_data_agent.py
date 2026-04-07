@@ -1,8 +1,8 @@
 """
-ExternalDataAgent — discovers and suggests external data joins.
+ExternalDataAgent — discovers and suggests external data joins (Polars).
 
-Currently supports DuckDB tables (holidays_pl, macro_eu) stored in ./data/external/.
-Gracefully degrades when DuckDB is not available or tables don't exist.
+Currently supports CSV/Parquet files stored in ./data/external/.
+Gracefully degrades when no external files exist.
 """
 
 from __future__ import annotations
@@ -10,12 +10,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+import polars as pl
 
 from forecaster.agents.base import BaseAgent
 from forecaster.core.context import AgentDecision, ContextWindow
 
-# Default path for external data directory (DuckDB or CSV fallback)
 _EXTERNAL_DATA_DIR = Path(__file__).parent.parent / "data" / "external"
 
 
@@ -50,10 +49,10 @@ class ExternalDataAgent(BaseAgent):
                 confidence=1.0,
             )
 
-        # Parse primary dates
         try:
-            primary_dates = pd.to_datetime(df[dt_col]).dt.normalize()
-            primary_set = set(primary_dates.dropna().dt.strftime("%Y-%m-%d"))
+            primary_set = set(
+                df[dt_col].cast(pl.Date, strict=False).drop_nulls().cast(pl.Utf8).to_list()
+            )
         except Exception:
             return context, AgentDecision(
                 agent_name=self.name,
@@ -63,7 +62,6 @@ class ExternalDataAgent(BaseAgent):
                 confidence=1.0,
             )
 
-        # Discover available external tables
         available_tables = self._discover_tables()
 
         if not available_tables:
@@ -76,7 +74,6 @@ class ExternalDataAgent(BaseAgent):
                 confidence=1.0,
             )
 
-        # Evaluate each table for join suitability
         suggestions: list[dict[str, Any]] = []
         for table_name, table_df in available_tables.items():
             suggestion = self._evaluate_join(table_name, table_df, primary_set, context)
@@ -92,16 +89,12 @@ class ExternalDataAgent(BaseAgent):
                 confidence=0.9,
             )
 
-        # Best suggestion
         best = max(suggestions, key=lambda s: s["overlap_pct"])
-
-        # If overlap > 90% and seasonality detected → high confidence
         seasonality = context.data_profile.has_seasonality if context.data_profile else False
         confidence = min(best["overlap_pct"] / 100.0, 0.95)
         if seasonality and best["overlap_pct"] > 80:
             confidence = min(confidence + 0.1, 0.98)
 
-        # Needs confirmation for any join
         decision = AgentDecision(
             agent_name=self.name,
             decision_type="external_data_join",
@@ -124,21 +117,15 @@ class ExternalDataAgent(BaseAgent):
                     else ""
                 )
             ),
-            requires_confirmation=True,  # Always ask user before joining external data
+            requires_confirmation=True,
             estimated_compute_seconds=0.2,
             estimated_memory_mb=max(5, best.get("size_mb", 5)),
         )
 
         return context, decision
 
-    # -- Join execution (called after user confirms) -----------------------
-
     def apply_join(self, context: ContextWindow, table_name: str) -> ContextWindow:
-        """
-        Apply the external data join after user confirmation.
-
-        Returns updated context with joined data registered.
-        """
+        """Apply the external data join after user confirmation."""
         tables = self._discover_tables()
         if table_name not in tables:
             context.log_decision(
@@ -159,30 +146,22 @@ class ExternalDataAgent(BaseAgent):
             return context
 
         try:
-            # Normalize dates for join
-            df_copy = df.copy()
-            df_copy["__join_date"] = pd.to_datetime(df_copy[dt_col]).dt.normalize()
-
-            # Find date column in external table
             ext_date_col = self._find_date_col(ext_df)
             if ext_date_col is None:
                 return context
 
-            ext_df_copy = ext_df.copy()
-            ext_df_copy["__join_date"] = pd.to_datetime(ext_df_copy[ext_date_col]).dt.normalize()
-
-            # Get feature columns (non-date)
             feature_cols = [c for c in ext_df.columns if c != ext_date_col]
 
-            # Left join
-            merged = df_copy.merge(
-                ext_df_copy[["__join_date"] + feature_cols],
-                on="__join_date",
-                how="left",
+            # Normalize both date columns to Date for join
+            df_join = df.with_columns(
+                pl.col(dt_col).cast(pl.Date, strict=False).alias("__join_date")
             )
-            merged.drop(columns=["__join_date"], inplace=True)
+            ext_join = ext_df.with_columns(
+                pl.col(ext_date_col).cast(pl.Date, strict=False).alias("__join_date")
+            ).select(["__join_date"] + feature_cols)
 
-            # Register the external data and update primary
+            merged = df_join.join(ext_join, on="__join_date", how="left").drop("__join_date")
+
             context.register_data(table_name, ext_df)
             first_key = next(iter(context.data_registry))
             context.data_registry[first_key] = merged
@@ -192,7 +171,7 @@ class ExternalDataAgent(BaseAgent):
                     agent_name=self.name,
                     decision_type="external_data_join",
                     action=f"joined: {table_name}",
-                    parameters={"features_added": feature_cols, "rows": len(merged)},
+                    parameters={"features_added": feature_cols, "rows": merged.height},
                     confidence=0.95,
                     reasoning=f"Joined {len(feature_cols)} features from {table_name}.",
                 )
@@ -209,44 +188,38 @@ class ExternalDataAgent(BaseAgent):
 
         return context
 
-    # -- Discovery helpers -------------------------------------------------
-
-    def _discover_tables(self) -> dict[str, pd.DataFrame]:
-        """Discover available external data tables."""
-        tables: dict[str, pd.DataFrame] = {}
-
+    def _discover_tables(self) -> dict[str, pl.DataFrame]:
+        tables: dict[str, pl.DataFrame] = {}
         if not self.external_dir.exists():
             return tables
-
         for fp in self.external_dir.iterdir():
             if fp.suffix == ".csv":
                 try:
-                    tables[fp.stem] = pd.read_csv(fp)
+                    tables[fp.stem] = pl.read_csv(fp)
                 except Exception:
                     continue
             elif fp.suffix == ".parquet":
                 try:
-                    tables[fp.stem] = pd.read_parquet(fp)
+                    tables[fp.stem] = pl.read_parquet(fp)
                 except Exception:
                     continue
-
         return tables
 
     def _evaluate_join(
         self,
         table_name: str,
-        table_df: pd.DataFrame,
+        table_df: pl.DataFrame,
         primary_dates: set[str],
         context: ContextWindow,
     ) -> dict[str, Any] | None:
-        """Evaluate a single external table for join suitability."""
         date_col = self._find_date_col(table_df)
         if date_col is None:
             return None
 
         try:
-            ext_dates = pd.to_datetime(table_df[date_col]).dt.normalize()
-            ext_set = set(ext_dates.dropna().dt.strftime("%Y-%m-%d"))
+            ext_set = set(
+                table_df[date_col].cast(pl.Date, strict=False).drop_nulls().cast(pl.Utf8).to_list()
+            )
         except Exception:
             return None
 
@@ -256,29 +229,29 @@ class ExternalDataAgent(BaseAgent):
 
         overlap_pct = len(overlap) / len(primary_dates) * 100
         if overlap_pct < 10:
-            return None  # Too little overlap
+            return None
 
         feature_cols = [c for c in table_df.columns if c != date_col]
+        size_mb = table_df.estimated_size("mb")
 
         return {
             "table_name": table_name,
             "overlap_pct": round(overlap_pct, 1),
             "n_features": len(feature_cols),
             "feature_columns": feature_cols,
-            "size_mb": table_df.memory_usage(deep=True).sum() / (1024 * 1024),
+            "size_mb": size_mb,
         }
 
     @staticmethod
-    def _find_date_col(df: pd.DataFrame) -> str | None:
-        """Find the date column in a DataFrame."""
+    def _find_date_col(df: pl.DataFrame) -> str | None:
         for col in df.columns:
-            if pd.api.types.is_datetime64_any_dtype(df[col]):
+            if df[col].dtype.is_temporal():
                 return col
         dt_kw = ["date", "time", "timestamp", "dt", "data"]
         for col in df.columns:
             if any(kw in col.lower() for kw in dt_kw):
                 try:
-                    pd.to_datetime(df[col].dropna().head(5))
+                    df[col].drop_nulls().head(5).cast(pl.Utf8).str.to_datetime(strict=False)
                     return col
                 except Exception:
                     continue

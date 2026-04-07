@@ -6,8 +6,9 @@ For local dev: falls back to file system if AZURE_STORAGE_CONNECTION_STRING is n
 
 import io
 from pathlib import Path
+from typing import cast
 
-import pandas as pd
+import polars as pl
 
 from app.config import get_settings
 
@@ -56,14 +57,14 @@ class BlobStorage:
             return str(local_path)
 
     def upload_df(
-        self, container: str, blob_path: str, df: pd.DataFrame, fmt: str = "parquet"
+        self, container: str, blob_path: str, df: pl.DataFrame, fmt: str = "parquet"
     ) -> str:
         """Upload DataFrame as parquet or CSV."""
         buf = io.BytesIO()
         if fmt == "parquet":
-            df.to_parquet(buf, index=False)
+            df.write_parquet(buf)
         else:
-            df.to_csv(buf, index=False)
+            df.write_csv(buf)
         buf.seek(0)
         return self.upload_bytes(container, blob_path, buf.getvalue())
 
@@ -85,21 +86,13 @@ class BlobStorage:
                 raise FileNotFoundError(f"Blob not found: {local_path}")
             return local_path.read_bytes()
 
-    def download_df(self, container: str, blob_path: str) -> pd.DataFrame:
-        """Download blob → DataFrame."""
+    def download_df(self, container: str, blob_path: str) -> pl.DataFrame:
+        """Download blob → Polars DataFrame."""
+        from forecaster.utils.tabular import read_df_from_bytes
+
         data = self.download_bytes(container, blob_path)
-        buf = io.BytesIO(data)
-        if blob_path.endswith(".parquet"):
-            return pd.read_parquet(buf)
-        elif blob_path.endswith(".csv"):
-            return pd.read_csv(buf)
-        else:
-            # Try parquet first, fallback to CSV
-            try:
-                return pd.read_parquet(buf)
-            except Exception:
-                buf.seek(0)
-                return pd.read_csv(buf)
+        # forecaster helpers are Any from backend mypy's perspective
+        return cast(pl.DataFrame, read_df_from_bytes(data, path_hint=blob_path))
 
     def download_model(self, blob_path: str) -> bytes:
         """Download model artifact bytes."""

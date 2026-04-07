@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-import pandas as pd
+import polars as pl
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -227,15 +227,15 @@ class ContextWindow(BaseModel):
         )
         return ok
 
-    def register_data(self, name: str, df: pd.DataFrame) -> None:
+    def register_data(self, name: str, df: pl.DataFrame) -> None:
         """Register a DataFrame in the data registry."""
         self.data_registry[name] = df
 
-    def get_data(self, name: str) -> pd.DataFrame | None:
+    def get_data(self, name: str) -> pl.DataFrame | None:
         """Get DataFrame from registry."""
         return self.data_registry.get(name)
 
-    def get_primary_data(self) -> pd.DataFrame | None:
+    def get_primary_data(self) -> pl.DataFrame | None:
         """Get the primary (first registered) DataFrame."""
         if not self.data_registry:
             return None

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from forecaster.core.session import ForecastResult
 
@@ -48,7 +48,7 @@ class WorkflowResult:
     best_model_name: str = ""
     best_model: Any = None
     forecast_result: ForecastResult | None = None
-    prepared_df: pd.DataFrame | None = None
+    prepared_df: pl.DataFrame | None = None
     all_model_results: dict[str, dict] = field(default_factory=dict)
     total_duration: float = 0.0
     features_config: dict[str, Any] = field(default_factory=dict)
@@ -60,7 +60,7 @@ class WorkflowResult:
 
 
 def run_forecast_workflow(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     datetime_column: str,
     target_column: str,
     horizon: int,
@@ -147,7 +147,7 @@ def run_forecast_workflow(
             col
             for col in df.columns
             if col not in reserved_cols
-            and pd.api.types.is_numeric_dtype(df[col])
+            and df[col].dtype.is_numeric()
             and not col.startswith("Unnamed")
             and col != "index"
         ]
@@ -170,8 +170,18 @@ def run_forecast_workflow(
             has_future_exog = future_exog_df is not None
 
             if has_future_exog:
+                n_rows_exog = (
+                    future_exog_df.height
+                    if isinstance(future_exog_df, pl.DataFrame)
+                    else len(future_exog_df)
+                )
+                n_cols_exog = (
+                    future_exog_df.width
+                    if isinstance(future_exog_df, pl.DataFrame)
+                    else len(future_exog_df.columns)
+                )
                 step.details.append(
-                    f"✅ Future exog data provided: {len(future_exog_df):,} rows × {len(future_exog_df.columns)} cols"
+                    f"✅ Future exog data provided: {n_rows_exog:,} rows × {n_cols_exog} cols"
                 )
                 analysis["use_exog"] = True
                 analysis["future_exog_df"] = future_exog_df
@@ -221,26 +231,27 @@ def run_forecast_workflow(
             if target_column in prepared_df.columns:
                 n_neg = int((prepared_df[target_column] < 0).sum())
                 if n_neg > 0:
-                    prepared_df = prepared_df.copy()
-                    prepared_df[target_column] = prepared_df[target_column].clip(lower=0)
+                    prepared_df = prepared_df.with_columns(
+                        pl.col(target_column).clip(lower_bound=0)
+                    )
                     prep_log.append(
                         f"✅ Clipped {n_neg:,} negative values to 0 (non-negative metric)"
                     )
 
         step.details = prep_log if prep_log else ["✅ Data is clean — no preparation needed"]
-        step.data = {"n_rows_before": len(df), "n_rows_after": len(prepared_df)}
+        step.data = {"n_rows_before": df.height, "n_rows_after": prepared_df.height}
         result.prepared_df = prepared_df
 
         step.status = "done"
         step.duration = time.time() - t0
-        step.message = f"Prepared ({len(prepared_df):,} rows)"
+        step.message = f"Prepared ({prepared_df.height:,} rows)"
         report("preparation", "done", step.message)
 
     except Exception as e:
         step.status = "failed"
         step.message = f"Preparation failed: {str(e)}"
         step.details = [f"⚠️ {step.message} — using original data"]
-        result.prepared_df = df.copy()
+        result.prepared_df = df.clone()
         report("preparation", "failed", step.message)
 
     # =========================================================================
@@ -290,7 +301,7 @@ def run_forecast_workflow(
     report("training", "running", "Training models...")
     t0 = time.time()
 
-    train_df = result.prepared_df if result.prepared_df is not None else df.copy()
+    train_df = result.prepared_df if result.prepared_df is not None else df.clone()
 
     # Determine which models to train
     from forecaster.agents.model_agent import ModelAgent
@@ -369,7 +380,7 @@ def run_forecast_workflow(
             print(f"[Workflow] {model_name} failed: {str(e)}", file=sys.stderr)
 
     # Hyperparameter tuning for LightGBM
-    if "lightgbm" in trained_models and len(train_df) >= 500:
+    if "lightgbm" in trained_models and train_df.height >= 500:
         report("training", "running", "Tuning LightGBM hyperparameters...")
         try:
             # Get future_exog_df from analysis
@@ -501,29 +512,30 @@ def run_forecast_workflow(
 
         if isinstance(best_model, MLForecastModel):
             pred_df = best_model.predict(horizon)
-            predictions = pred_df["prediction"].tolist()
+            predictions = pred_df["prediction"].to_list()
             if "datetime" in pred_df.columns:
-                dates = pred_df["datetime"].astype(str).tolist()
+                dates = [str(d) for d in pred_df["datetime"].to_list()]
             elif "ds" in pred_df.columns:
-                dates = pred_df["ds"].astype(str).tolist()
+                dates = [str(d) for d in pred_df["ds"].to_list()]
             else:
                 dates = list(range(len(predictions)))
 
             group_info = None
             if group_cols and "unique_id" in pred_df.columns:
                 group_info = {
-                    "groups": pred_df["unique_id"].unique().tolist(),
-                    "n_groups": pred_df["unique_id"].nunique(),
+                    "groups": pred_df["unique_id"].unique().to_list(),
+                    "n_groups": pred_df["unique_id"].n_unique(),
                     "group_columns": group_cols,
                 }
         else:
-            # Simple models (naive / linear) — need to re-predict
-            proc_df = train_df.copy()
-            proc_df[datetime_column] = pd.to_datetime(proc_df[datetime_column], errors="coerce")
-            proc_df = proc_df.dropna(subset=[datetime_column]).set_index(datetime_column)
-            proc_df = proc_df[[target_column]].copy()
-            proc_df.columns = ["value"]
-            proc_df = proc_df.sort_index().dropna()
+            # Simple models (naive / linear) — pass Polars DataFrame directly
+            proc_df = (
+                train_df.with_columns(pl.col(datetime_column).cast(pl.Datetime, strict=False))
+                .drop_nulls(datetime_column)
+                .select([datetime_column, pl.col(target_column).alias("value")])
+                .sort(datetime_column)
+                .drop_nulls("value")
+            )
             best_model.fit(proc_df)
             simple_result = best_model.predict(horizon)
             predictions = simple_result.predictions
@@ -564,7 +576,7 @@ def run_forecast_workflow(
 
         data_quality = analyze_data_quality(df, datetime_column, target_column)
         historical_values = (
-            df[target_column].dropna().tolist() if target_column in df.columns else []
+            df[target_column].drop_nulls().to_list() if target_column in df.columns else []
         )
         forecast_sanity = check_forecast_sanity(predictions, historical_values, target_column)
         residual_analysis = {"is_random": True, "autocorr_lag1": 0.0, "has_trend": False}
@@ -605,12 +617,16 @@ def run_forecast_workflow(
                 groups = group_info.get("groups", []) if group_info else []
                 for gid in groups:
                     try:
-                        uid_col = "_unique_id_tmp"
-                        gdf = df.copy()
-                        gdf[uid_col] = gdf[group_cols].astype(str).agg("_".join, axis=1)
-                        gdf = gdf[gdf[uid_col] == gid].sort_values(datetime_column)
-                        gdf[target_column] = pd.to_numeric(gdf[target_column], errors="coerce")
-                        actual_vals = gdf[target_column].dropna().tolist()
+                        uid_expr = pl.concat_str(
+                            [pl.col(c).cast(pl.Utf8) for c in group_cols], separator="_"
+                        )
+                        gdf = (
+                            df.filter(uid_expr == gid)
+                            .sort(datetime_column)
+                            .with_columns(pl.col(target_column).cast(pl.Float64, strict=False))
+                            .drop_nulls(target_column)
+                        )
+                        actual_vals = gdf[target_column].to_list()
 
                         if len(actual_vals) < 20:
                             continue
@@ -634,7 +650,9 @@ def run_forecast_workflow(
                         }
 
                         if datetime_column in gdf.columns:
-                            test_dates = gdf[datetime_column].iloc[split_idx:].astype(str).tolist()
+                            test_dates = [
+                                str(d) for d in gdf[datetime_column].slice(split_idx).to_list()
+                            ]
                         else:
                             test_dates = list(range(split_idx, len(actual_vals)))
 
@@ -825,29 +843,28 @@ def _default_features_config() -> dict[str, Any]:
 
 def _evaluate_model_on_holdout(
     model_name: str,
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     datetime_col: str,
     target_col: str,
     horizon: int,
     gap: int,
     group_cols: list[str] | None,
     features_config: dict[str, Any],
-    future_exog_df: pd.DataFrame | None = None,
+    future_exog_df: pl.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Train a model and evaluate on holdout. Returns RMSE, MAPE, trained model."""
     t0 = time.time()
 
-    # For evaluation: aggregate to single series (fast, consistent)
-    eval_df = df.copy()
-    if datetime_col in eval_df.columns:
-        eval_df[datetime_col] = pd.to_datetime(eval_df[datetime_col], errors="coerce")
-        eval_df = eval_df.dropna(subset=[datetime_col])
-        eval_df = eval_df.sort_values(datetime_col)
+    eval_df = df.clone()
+    if datetime_col in eval_df.columns and not eval_df[datetime_col].dtype.is_temporal():
+        eval_df = eval_df.with_columns(pl.col(datetime_col).cast(pl.Datetime, strict=False))
+    eval_df = eval_df.drop_nulls(datetime_col).sort(datetime_col)
 
-    eval_df[target_col] = pd.to_numeric(eval_df[target_col], errors="coerce")
-    eval_df = eval_df.dropna(subset=[target_col])
+    if not eval_df[target_col].dtype.is_numeric():
+        eval_df = eval_df.with_columns(pl.col(target_col).cast(pl.Float64, strict=False))
+    eval_df = eval_df.drop_nulls(target_col)
 
-    n = len(eval_df)
+    n = eval_df.height
     if n < 20:
         return {
             "holdout_rmse": float("inf"),
@@ -857,9 +874,9 @@ def _evaluate_model_on_holdout(
         }
 
     split = int(n * 0.8)
-    train_split = eval_df.iloc[:split]
-    test_split = eval_df.iloc[split:]
-    test_values = test_split[target_col].values
+    train_split = eval_df.slice(0, split)
+    test_split = eval_df.slice(split)
+    test_values = test_split[target_col].to_numpy()
 
     if model_name in ("lightgbm", "lightgbm_tuned"):
         return _eval_lightgbm(
@@ -921,11 +938,11 @@ def _eval_lightgbm(
     )
 
     # Drop group columns from holdout eval to prevent them becoming exogenous features
-    eval_train = train_split.copy()
+    eval_train = train_split
     if group_cols:
-        eval_train = eval_train.drop(
-            columns=[c for c in group_cols if c in eval_train.columns], errors="ignore"
-        )
+        drop_cols = [c for c in group_cols if c in eval_train.columns]
+        if drop_cols:
+            eval_train = eval_train.drop(drop_cols)
 
     eval_model.fit(
         eval_train, datetime_col, target_col, group_by_columns=None, future_exog_df=future_exog_df
@@ -933,7 +950,7 @@ def _eval_lightgbm(
 
     h = min(len(test_values), horizon * 2)
     preds_df = eval_model.predict(h)
-    pred_values = preds_df["prediction"].values
+    pred_values = preds_df["prediction"].to_numpy()
 
     min_len = min(len(test_values), len(pred_values))
     if min_len > 0:
@@ -972,26 +989,21 @@ def _eval_lightgbm(
 
 
 def _eval_simple_model(model_name, train_split, test_values, datetime_col, target_col, full_df, t0):
-    """Evaluate a simple model (naive, linear) on holdout."""
+    """Evaluate a simple model (naive, linear) on holdout (Polars)."""
     from forecaster.models.simple import LinearForecaster, NaiveForecaster
 
-    # Prepare for simple models (DatetimeIndex + 'value')
-    train_processed = train_split.copy()
-    if datetime_col in train_processed.columns:
-        train_processed[datetime_col] = pd.to_datetime(
-            train_processed[datetime_col], errors="coerce"
+    def _prep_simple(df_in: pl.DataFrame) -> pl.DataFrame:
+        return (
+            df_in.with_columns(pl.col(datetime_col).cast(pl.Datetime, strict=False))
+            .drop_nulls(datetime_col)
+            .select([datetime_col, pl.col(target_col).alias("value")])
+            .sort(datetime_col)
+            .drop_nulls("value")
         )
-        train_processed = train_processed.dropna(subset=[datetime_col])
-        train_processed = train_processed.set_index(datetime_col)
-    train_processed = train_processed[[target_col]].copy()
-    train_processed.columns = ["value"]
-    train_processed = train_processed.sort_index().dropna()
 
-    if model_name == "naive":
-        model = NaiveForecaster()
-    else:
-        model = LinearForecaster()
+    train_processed = _prep_simple(train_split)
 
+    model = NaiveForecaster() if model_name == "naive" else LinearForecaster()
     model.fit(train_processed)
     result = model.predict(len(test_values))
     predicted = np.array(result.predictions[: len(test_values)])
@@ -1005,16 +1017,7 @@ def _eval_simple_model(model_name, train_split, test_values, datetime_col, targe
     else:
         rmse, mape = float("inf"), float("inf")
 
-    # For final model, retrain on full data
-    full_processed = full_df.copy()
-    if datetime_col in full_processed.columns:
-        full_processed[datetime_col] = pd.to_datetime(full_processed[datetime_col], errors="coerce")
-        full_processed = full_processed.dropna(subset=[datetime_col])
-        full_processed = full_processed.set_index(datetime_col)
-    full_processed = full_processed[[target_col]].copy()
-    full_processed.columns = ["value"]
-    full_processed = full_processed.sort_index().dropna()
-
+    full_processed = _prep_simple(full_df)
     final_model = NaiveForecaster() if model_name == "naive" else LinearForecaster()
     final_model.fit(full_processed)
 
@@ -1033,14 +1036,14 @@ def _eval_simple_model(model_name, train_split, test_values, datetime_col, targe
 
 
 def _tune_lightgbm_hyperparameters(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     datetime_col: str,
     target_col: str,
     horizon: int,
     gap: int,
     group_cols: list[str] | None,
     features_config: dict[str, Any],
-    future_exog_df: pd.DataFrame | None = None,
+    future_exog_df: pl.DataFrame | None = None,
 ) -> dict[str, Any] | None:
     """Simple grid search over LightGBM hyperparameters."""
     from forecaster.models.mlforecast_models import MLFORECAST_AVAILABLE
@@ -1048,17 +1051,17 @@ def _tune_lightgbm_hyperparameters(
     if not MLFORECAST_AVAILABLE:
         return None
 
-    # Quick holdout setup
-    eval_df = df.copy()
-    if datetime_col in eval_df.columns:
-        eval_df[datetime_col] = pd.to_datetime(eval_df[datetime_col], errors="coerce")
-        eval_df = eval_df.dropna(subset=[datetime_col]).sort_values(datetime_col)
-    eval_df[target_col] = pd.to_numeric(eval_df[target_col], errors="coerce")
-    eval_df = eval_df.dropna(subset=[target_col])
+    eval_df = df.clone()
+    if datetime_col in eval_df.columns and not eval_df[datetime_col].dtype.is_temporal():
+        eval_df = eval_df.with_columns(pl.col(datetime_col).cast(pl.Datetime, strict=False))
+    eval_df = eval_df.drop_nulls(datetime_col).sort(datetime_col)
+    if not eval_df[target_col].dtype.is_numeric():
+        eval_df = eval_df.with_columns(pl.col(target_col).cast(pl.Float64, strict=False))
+    eval_df = eval_df.drop_nulls(target_col)
 
-    n = len(eval_df)
+    n = eval_df.height
     split = int(n * 0.8)
-    test_values = eval_df[target_col].values[split:]
+    test_values = eval_df[target_col].slice(split).to_numpy()
 
     if len(test_values) == 0:
         return None
@@ -1085,7 +1088,7 @@ def _tune_lightgbm_hyperparameters(
         try:
             result = _eval_lightgbm(
                 df,
-                eval_df.iloc[:split],
+                eval_df.slice(0, split),
                 test_values,
                 datetime_col,
                 target_col,
@@ -1110,7 +1113,7 @@ def _tune_lightgbm_hyperparameters(
     # Retrain best config on full data (already done by _eval_lightgbm)
     final = _eval_lightgbm(
         df,
-        eval_df.iloc[:split],
+        eval_df.slice(0, split),
         test_values,
         datetime_col,
         target_col,

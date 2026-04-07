@@ -21,7 +21,7 @@ from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import pandas as pd
+import polars as pl
 
 from forecaster.agents.external_data_agent import ExternalDataAgent
 from forecaster.agents.feature_engineer import FeatureEngineerAgent
@@ -321,7 +321,7 @@ class ForecastOrchestrator:
 
     @staticmethod
     def _execute_model(
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         model_type: str,
         datetime_column: str | None,
         target_column: str | None,

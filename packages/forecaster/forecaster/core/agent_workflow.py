@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from forecaster.core.context import (
     AgentDecision,
@@ -58,7 +58,7 @@ class AgentWorkflowResult:
     best_model_name: str = ""
     best_model: Any = None
     forecast_result: ForecastResult | None = None
-    prepared_df: pd.DataFrame | None = None
+    prepared_df: pl.DataFrame | None = None
     all_model_results: dict[str, dict] = field(default_factory=dict)
     total_duration: float = 0.0
     features_config: dict[str, Any] = field(default_factory=dict)
@@ -154,7 +154,7 @@ def _specs_to_features_config(
 
 
 def run_agent_workflow(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     datetime_column: str,
     target_column: str,
     horizon: int,
@@ -289,7 +289,7 @@ def run_agent_workflow(
                 c
                 for c in df.columns
                 if c not in reserved
-                and pd.api.types.is_numeric_dtype(df[c])
+                and df[c].dtype.is_numeric()
                 and not c.startswith("Unnamed")
                 and c != "index"
             ]
@@ -356,18 +356,18 @@ def run_agent_workflow(
                     prep_log.append(f"✅ Clipped {n_neg:,} negative values to 0")
 
         step.details = prep_log if prep_log else ["✅ Data is clean — no preparation needed"]
-        step.data = {"n_rows_before": len(df), "n_rows_after": len(prepared_df)}
+        step.data = {"n_rows_before": df.height, "n_rows_after": prepared_df.height}
         result.prepared_df = prepared_df
         step.status = "done"
         step.duration = time.time() - t0
-        step.message = f"Prepared ({len(prepared_df):,} rows)"
+        step.message = f"Prepared ({prepared_df.height:,} rows)"
         report("preparation", "done", step.message)
 
     except Exception as e:
         step.status = "failed"
         step.message = f"Preparation failed: {e}"
         step.details = [f"⚠️ {step.message} — using original data"]
-        result.prepared_df = df.copy()
+        result.prepared_df = df.clone()
         report("preparation", "failed", step.message)
 
     # Also update context's primary data with prepared df
@@ -391,7 +391,7 @@ def run_agent_workflow(
         n_specs = len(ctx.feature_specs)
         # Convert to workflow_engine format for training
         prep_df = result.prepared_df if result.prepared_df is not None else df
-        features_config = _specs_to_features_config(ctx.feature_specs, gap, len(prep_df))
+        features_config = _specs_to_features_config(ctx.feature_specs, gap, prep_df.height)
         result.features_config = features_config
 
         step.details.append(f"📊 Generated {n_specs} feature specifications:")
@@ -438,7 +438,7 @@ def run_agent_workflow(
         step.details = [f"⚠️ {step.message} — using defaults"]
         # Build data-size-aware defaults
         prep_df = result.prepared_df if result.prepared_df is not None else df
-        n = len(prep_df)
+        n = prep_df.height
         max_lag = max(1, n // 3)
         max_w = max(1, n // 4)
         default_lags = [l for l in [1, 7, 14] if l <= max_lag]  # noqa: E741
@@ -620,7 +620,7 @@ def run_agent_workflow(
             print(f"[AgentWorkflow] {model_name} failed: {e}", file=sys.stderr)
 
     # Hyperparameter tuning for LightGBM
-    if "lightgbm" in trained_models and len(train_df) >= 500:
+    if "lightgbm" in trained_models and train_df.height >= 500:
         report("training", "running", "Tuning LightGBM hyperparameters...")
         try:
             tuned = _tune_lightgbm_hyperparameters(
@@ -784,29 +784,31 @@ def run_agent_workflow(
 
         if isinstance(best_model, MLForecastModel):
             pred_df = best_model.predict(horizon)
-            predictions = pred_df["prediction"].tolist()
+            predictions = pred_df["prediction"].to_list()
             if "datetime" in pred_df.columns:
-                dates = pred_df["datetime"].astype(str).tolist()
+                dates = [str(d) for d in pred_df["datetime"].to_list()]
             elif "ds" in pred_df.columns:
-                dates = pred_df["ds"].astype(str).tolist()
+                dates = [str(d) for d in pred_df["ds"].to_list()]
             else:
                 dates = list(range(len(predictions)))
 
             group_info = None
             if group_cols and "unique_id" in pred_df.columns:
                 group_info = {
-                    "groups": pred_df["unique_id"].unique().tolist(),
-                    "n_groups": pred_df["unique_id"].nunique(),
+                    "groups": pred_df["unique_id"].unique().to_list(),
+                    "n_groups": pred_df["unique_id"].n_unique(),
                     "group_columns": group_cols,
                 }
         else:
-            # Simple models
-            proc_df = train_df.copy()
-            proc_df[datetime_column] = pd.to_datetime(proc_df[datetime_column], errors="coerce")
-            proc_df = proc_df.dropna(subset=[datetime_column]).set_index(datetime_column)
-            proc_df = proc_df[[target_column]].copy()
-            proc_df.columns = ["value"]
-            proc_df = proc_df.sort_index().dropna()
+            # Simple models — pass Polars df directly (SimpleForecasters now accept pl.DataFrame)
+            proc_df = (
+                train_df.with_columns(pl.col(datetime_column).cast(pl.Datetime, strict=False))
+                .drop_nulls(datetime_column)
+                .select([datetime_column, target_column])
+                .rename({target_column: "value"})
+                .sort(datetime_column)
+                .drop_nulls("value")
+            )
             best_model.fit(proc_df)
             simple_result = best_model.predict(horizon)
             predictions = simple_result.predictions
@@ -846,7 +848,7 @@ def run_agent_workflow(
 
         data_quality = analyze_data_quality(df, datetime_column, target_column)
         historical_values = (
-            df[target_column].dropna().tolist() if target_column in df.columns else []
+            df[target_column].drop_nulls().to_list() if target_column in df.columns else []
         )
         forecast_sanity = check_forecast_sanity(predictions, historical_values, target_column)
         residual_analysis = {
@@ -891,12 +893,16 @@ def run_agent_workflow(
                 groups = group_info.get("groups", []) if group_info else []
                 for gid in groups:
                     try:
-                        uid_col = "_unique_id_tmp"
-                        gdf = df.copy()
-                        gdf[uid_col] = gdf[group_cols].astype(str).agg("_".join, axis=1)
-                        gdf = gdf[gdf[uid_col] == gid].sort_values(datetime_column)
-                        gdf[target_column] = pd.to_numeric(gdf[target_column], errors="coerce")
-                        actual_vals = gdf[target_column].dropna().tolist()
+                        uid_expr = pl.concat_str(
+                            [pl.col(c).cast(pl.Utf8) for c in group_cols], separator="_"
+                        )
+                        gdf = (
+                            df.filter(uid_expr == gid)
+                            .sort(datetime_column)
+                            .with_columns(pl.col(target_column).cast(pl.Float64, strict=False))
+                            .drop_nulls(target_column)
+                        )
+                        actual_vals = gdf[target_column].to_list()
 
                         if len(actual_vals) < 20:
                             continue
@@ -918,7 +924,9 @@ def run_agent_workflow(
                         }
 
                         if datetime_column in gdf.columns:
-                            test_dates = gdf[datetime_column].iloc[split_idx:].astype(str).tolist()
+                            test_dates = [
+                                str(d) for d in gdf[datetime_column].slice(split_idx).to_list()
+                            ]
                         else:
                             test_dates = list(range(split_idx, len(actual_vals)))
 

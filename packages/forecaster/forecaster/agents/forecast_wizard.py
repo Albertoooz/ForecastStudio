@@ -13,10 +13,11 @@ The UI renders each step and waits for user confirmation before proceeding.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 # =============================================================================
 # WIZARD STATE
@@ -67,7 +68,7 @@ class WizardState:
 
 
 def analyze_for_wizard(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     datetime_column: str,
     target_column: str,
     group_cols: list[str],
@@ -80,8 +81,8 @@ def analyze_for_wizard(
     Returns structured analysis with issues, stats, and recommendations.
     """
     result = {
-        "n_rows": len(df),
-        "n_columns": len(df.columns),
+        "n_rows": df.height,
+        "n_columns": df.width,
         "datetime_column": datetime_column,
         "target_column": target_column,
         "group_columns": group_cols,
@@ -96,47 +97,49 @@ def analyze_for_wizard(
 
     # --- Target column analysis ---
     if target_column in df.columns:
-        target = df[target_column]
-        target_numeric = pd.to_numeric(target, errors="coerce")
-        n_missing = int(target_numeric.isna().sum())
-        n_total = len(target_numeric)
+        target_series = df[target_column].cast(pl.Float64, strict=False)
+        n_missing = int(target_series.null_count())
+        n_total = df.height
         missing_pct = (n_missing / n_total * 100) if n_total > 0 else 0
-
-        clean = target_numeric.dropna()
+        clean = target_series.drop_nulls()
+        n_clean = clean.len()
 
         result["stats"] = {
-            "count": int(len(clean)),
+            "count": n_clean,
             "missing": n_missing,
             "missing_pct": round(missing_pct, 2),
-            "mean": round(float(clean.mean()), 4) if len(clean) > 0 else 0,
-            "std": round(float(clean.std()), 4) if len(clean) > 0 else 0,
-            "min": round(float(clean.min()), 4) if len(clean) > 0 else 0,
-            "max": round(float(clean.max()), 4) if len(clean) > 0 else 0,
-            "zeros_pct": round(float((clean == 0).sum() / len(clean) * 100), 2)
-            if len(clean) > 0
-            else 0,
-            "negative_pct": round(float((clean < 0).sum() / len(clean) * 100), 2)
-            if len(clean) > 0
+            "mean": round(float(clean.mean() or 0), 4) if n_clean > 0 else 0,
+            "std": round(float(clean.std() or 0), 4) if n_clean > 0 else 0,
+            "min": round(float(clean.min() or 0), 4) if n_clean > 0 else 0,
+            "max": round(float(clean.max() or 0), 4) if n_clean > 0 else 0,
+            "zeros_pct": round(float((clean == 0).sum() / n_clean * 100), 2) if n_clean > 0 else 0,
+            "negative_pct": round(float((clean < 0).sum() / n_clean * 100), 2)
+            if n_clean > 0
             else 0,
         }
 
         # Outliers (IQR method)
-        if len(clean) > 10:
-            q1, q3 = clean.quantile(0.25), clean.quantile(0.75)
+        if n_clean > 10:
+            q1 = float(clean.quantile(0.25) or 0)
+            q3 = float(clean.quantile(0.75) or 0)
             iqr = q3 - q1
             lower = q1 - 1.5 * iqr
             upper = q3 + 1.5 * iqr
             n_outliers = int(((clean < lower) | (clean > upper)).sum())
             result["stats"]["outliers"] = n_outliers
-            result["stats"]["outliers_pct"] = round(n_outliers / len(clean) * 100, 2)
+            result["stats"]["outliers_pct"] = round(n_outliers / n_clean * 100, 2)
             result["stats"]["outlier_bounds"] = {
                 "lower": round(float(lower), 4),
                 "upper": round(float(upper), 4),
             }
 
-        # Skewness
-        if len(clean) > 3:
-            result["stats"]["skewness"] = round(float(clean.skew()), 4)
+        # Skewness (manual: m3/m2^1.5)
+        if n_clean > 3:
+            arr = clean.to_numpy()
+            m2 = float(np.mean((arr - arr.mean()) ** 2))
+            m3 = float(np.mean((arr - arr.mean()) ** 3))
+            sk = m3 / (m2**1.5) if m2 > 0 else 0.0
+            result["stats"]["skewness"] = round(sk, 4)
 
         # Issues from target
         if missing_pct > 0:
@@ -180,42 +183,47 @@ def analyze_for_wizard(
     # --- Datetime analysis ---
     if datetime_column in df.columns:
         try:
-            dates = pd.to_datetime(df[datetime_column])
-            dates_sorted = dates.sort_values()
-            diffs = dates_sorted.diff().dropna()
-
-            if len(diffs) > 0:
-                mode_diff = diffs.mode()[0]
-                n_gaps = int((diffs != mode_diff).sum())
-                gap_pct = round(n_gaps / len(diffs) * 100, 2) if len(diffs) > 0 else 0
-
-                result["stats"]["frequency_gaps"] = n_gaps
-                result["stats"]["frequency_gap_pct"] = gap_pct
-
-                if gap_pct > 5:
-                    result["issues"].append(
-                        {
-                            "id": "frequency_gaps",
-                            "severity": "⚠️",
-                            "message": f"{n_gaps:,} irregular time gaps detected ({gap_pct:.1f}% of intervals)",
-                        }
-                    )
+            dates_s = (
+                df.sort(datetime_column)[datetime_column]
+                .cast(pl.Datetime, strict=False)
+                .drop_nulls()
+            )
+            if dates_s.len() > 1:
+                diffs_s = dates_s.diff().drop_nulls().dt.total_seconds()
+                if diffs_s.len() > 0:
+                    mode_diff = float(diffs_s.mode()[0])
+                    n_gaps = int((diffs_s != mode_diff).sum())
+                    gap_pct = round(n_gaps / diffs_s.len() * 100, 2)
+                    result["stats"]["frequency_gaps"] = n_gaps
+                    result["stats"]["frequency_gap_pct"] = gap_pct
+                    if gap_pct > 5:
+                        result["issues"].append(
+                            {
+                                "id": "frequency_gaps",
+                                "severity": "⚠️",
+                                "message": f"{n_gaps:,} irregular time gaps detected ({gap_pct:.1f}% of intervals)",
+                            }
+                        )
 
             # Duplicates
             if group_cols:
                 cols = [datetime_column] + [c for c in group_cols if c in df.columns]
-                if cols:
-                    n_dup = int(df.duplicated(subset=cols).sum())
-                    if n_dup > 0:
-                        result["issues"].append(
-                            {
-                                "id": "duplicate_timestamps",
-                                "severity": "⚠️",
-                                "message": f"{n_dup:,} duplicate timestamps within groups",
-                            }
-                        )
+                n_dup = (
+                    df.height
+                    - df.select(
+                        pl.concat_str([pl.col(c).cast(pl.Utf8) for c in cols], separator="_")
+                    ).n_unique()
+                )
+                if n_dup > 0:
+                    result["issues"].append(
+                        {
+                            "id": "duplicate_timestamps",
+                            "severity": "⚠️",
+                            "message": f"{n_dup:,} duplicate timestamps within groups",
+                        }
+                    )
             else:
-                n_dup = int(dates.duplicated().sum())
+                n_dup = df.height - df.select(pl.col(datetime_column)).n_unique()
                 if n_dup > 0:
                     result["issues"].append(
                         {
@@ -225,22 +233,24 @@ def analyze_for_wizard(
                         }
                     )
 
-            # Data age
-            last_date = dates.max()
-            data_age = (pd.Timestamp.now() - last_date).days
-            result["stats"]["data_age_days"] = int(data_age)
-            result["stats"]["date_range"] = (
-                f"{dates.min().strftime('%Y-%m-%d')} → {dates.max().strftime('%Y-%m-%d')}"
-            )
-
-            if data_age > 30:
-                result["issues"].append(
-                    {
-                        "id": "stale_data",
-                        "severity": "🔴",
-                        "message": f"Data is {data_age} days old — model may not reflect current patterns",
-                    }
-                )
+            last_date = dates_s.max()
+            mn = dates_s.min()
+            if last_date is not None and mn is not None:
+                if not isinstance(last_date, datetime):
+                    last_date = datetime.fromisoformat(str(last_date)[:19])
+                if not isinstance(mn, datetime):
+                    mn = datetime.fromisoformat(str(mn)[:19])
+                data_age = (datetime.now() - last_date).days
+                result["stats"]["data_age_days"] = int(data_age)
+                result["stats"]["date_range"] = f"{str(mn)[:10]} → {str(last_date)[:10]}"
+                if data_age > 30:
+                    result["issues"].append(
+                        {
+                            "id": "stale_data",
+                            "severity": "🔴",
+                            "message": f"Data is {data_age} days old — model may not reflect current patterns",
+                        }
+                    )
         except Exception:
             result["issues"].append(
                 {
@@ -252,21 +262,22 @@ def analyze_for_wizard(
 
     # --- Group analysis ---
     if group_cols and all(c in df.columns for c in group_cols):
-        if len(group_cols) == 1:
-            uid = df[group_cols[0]]
-        else:
-            uid = df[group_cols].astype(str).agg("_".join, axis=1)
-
-        group_counts = uid.value_counts()
+        uid_expr = pl.concat_str([pl.col(c).cast(pl.Utf8) for c in group_cols], separator="_")
+        group_counts_s = (
+            df.select(uid_expr.alias("__uid")).group_by("__uid").agg(pl.len().alias("n"))["n"]
+        )
+        n_groups = int(group_counts_s.len())
+        mn_g = int(group_counts_s.min() or 0)
+        mx_g = int(group_counts_s.max() or 0)
+        med_g = int(float(group_counts_s.median() or 0))
         result["group_stats"] = {
-            "n_groups": int(len(group_counts)),
-            "min_group_size": int(group_counts.min()),
-            "max_group_size": int(group_counts.max()),
-            "median_group_size": int(group_counts.median()),
+            "n_groups": n_groups,
+            "min_group_size": mn_g,
+            "max_group_size": mx_g,
+            "median_group_size": med_g,
         }
-
-        if group_counts.min() < 30:
-            small_groups = int((group_counts < 30).sum())
+        small_groups = int((group_counts_s < 30).sum())
+        if small_groups > 0:
             result["issues"].append(
                 {
                     "id": "small_groups",
@@ -276,29 +287,30 @@ def analyze_for_wizard(
             )
 
     # --- Sample size check ---
-    if len(df) < 50:
+    if df.height < 50:
         result["issues"].append(
             {
                 "id": "small_dataset",
                 "severity": "🔴",
-                "message": f"Only {len(df)} rows — insufficient for reliable ML forecasting",
+                "message": f"Only {df.height} rows — insufficient for reliable ML forecasting",
             }
         )
 
     # --- Column quality for all numeric columns ---
-    for col in df.select_dtypes(include=[np.number]).columns:
-        n_miss = int(df[col].isna().sum())
-        if n_miss > 0:
-            result["column_quality"][col] = {
-                "missing": n_miss,
-                "missing_pct": round(n_miss / len(df) * 100, 2),
-            }
+    for col in df.columns:
+        if df[col].dtype.is_numeric():
+            n_miss = int(df[col].null_count())
+            if n_miss > 0:
+                result["column_quality"][col] = {
+                    "missing": n_miss,
+                    "missing_pct": round(n_miss / df.height * 100, 2),
+                }
 
     # --- Info (positive signals) ---
     if not result["issues"]:
         result["info"].append("✅ No data quality issues detected")
-    if len(df) >= 1000:
-        result["info"].append(f"✅ Good sample size ({len(df):,} observations)")
+    if df.height >= 1000:
+        result["info"].append(f"✅ Good sample size ({df.height:,} observations)")
     if frequency:
         result["info"].append(f"✅ Consistent frequency detected: {frequency}")
 
@@ -656,7 +668,7 @@ def recommend_model(
 
 
 def evaluate_models(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     datetime_column: str,
     target_column: str,
     group_cols: list[str] | None,
@@ -674,30 +686,25 @@ def evaluate_models(
     if datetime_column not in df.columns or target_column not in df.columns:
         return {"best_model": None, "results": {}, "error": "Missing datetime/target column"}
 
-    # Aggregate by datetime for a clean single-series evaluation
-    eval_df = df.copy()
+    eval_df = df.clone()
     if group_cols:
-        [datetime_column] + [c for c in group_cols if c in df.columns]
-        eval_df = eval_df.groupby(datetime_column)[target_column].sum().reset_index()
+        eval_df = eval_df.group_by(datetime_column).agg(pl.col(target_column).sum())
 
-    eval_df = eval_df.sort_values(datetime_column).reset_index(drop=True)
-    n = len(eval_df)
+    eval_df = (
+        eval_df.sort(datetime_column)
+        .with_columns(pl.col(target_column).cast(pl.Float64, strict=False))
+        .drop_nulls(target_column)
+    )
+    n = eval_df.height
     if n < 20:
         return {"best_model": None, "results": {}, "error": "Not enough data for evaluation"}
 
     split = int(n * (1 - test_fraction))
-    train_df = eval_df.iloc[:split].copy()
-    test_df = eval_df.iloc[split:].copy()
+    train_df = eval_df.slice(0, split)
+    test_df = eval_df.slice(split)
 
-    # Convert to numeric
-    train_df[target_column] = pd.to_numeric(train_df[target_column], errors="coerce")
-    test_df[target_column] = pd.to_numeric(test_df[target_column], errors="coerce")
-
-    # Build processed DataFrame for simple models
-    train_processed = train_df.set_index(datetime_column)[[target_column]].copy()
-    train_processed.columns = ["value"]
-
-    test_values = test_df[target_column].dropna().values
+    train_processed = train_df.select([datetime_column, pl.col(target_column).alias("value")])
+    test_values = test_df[target_column].to_numpy()
     if len(test_values) == 0:
         return {"best_model": None, "results": {}, "error": "Test set has no valid values"}
 
@@ -723,11 +730,14 @@ def evaluate_models(
                 model = MLForecastModel()
                 model.fit(train_df, datetime_column, target_column, group_by_columns=None)
                 forecast = model.predict(horizon)
-                preds = forecast.predictions
+                preds = (
+                    forecast["prediction"].to_list()
+                    if isinstance(forecast, pl.DataFrame)
+                    else forecast.predictions
+                )
             else:
                 continue
 
-            # Align length
             if len(preds) != horizon:
                 preds = preds[:horizon]
 
@@ -737,7 +747,6 @@ def evaluate_models(
             )
 
             results[model_name] = {"rmse": rmse, "mape": mape}
-
             if best_rmse is None or rmse < best_rmse:
                 best_rmse = rmse
                 best_model = model_name
@@ -753,20 +762,19 @@ def evaluate_models(
 
 
 def apply_preparation(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     steps: list[WizardStep],
     datetime_column: str,
     target_column: str,
     frequency: str | None = None,
     group_cols: list[str] | None = None,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pl.DataFrame, list[str]]:
     """
-    Apply selected preparation steps to the DataFrame.
+    Apply selected preparation steps to the Polars DataFrame.
 
     Returns (modified_df, log_messages).
     """
-    df = df.copy()
-    log = []
+    log: list[str] = []
 
     for step in steps:
         if not step.enabled:
@@ -775,46 +783,46 @@ def apply_preparation(
         choice = step.selected or step.recommendation
 
         if step.id == "fill_missing" and choice != "skip":
-            before_missing = int(df[target_column].isna().sum())
-
+            if target_column not in df.columns:
+                continue
+            before_missing = int(df[target_column].null_count())
             if choice == "forward_fill":
-                df[target_column] = df[target_column].ffill()
+                df = df.with_columns(pl.col(target_column).forward_fill())
                 method = "forward fill"
             elif choice == "interpolate":
-                df[target_column] = df[target_column].interpolate(method="linear")
+                df = df.with_columns(pl.col(target_column).interpolate())
                 method = "linear interpolation"
             elif choice == "drop":
-                df = df.dropna(subset=[target_column])
+                df = df.drop_nulls(target_column)
                 method = "drop rows"
             else:
                 continue
-
-            after_missing = int(df[target_column].isna().sum())
+            after_missing = int(df[target_column].null_count())
             log.append(
                 f"✅ Filled {before_missing - after_missing:,} missing values using {method}"
             )
 
         elif step.id == "handle_outliers" and choice != "keep":
             if target_column in df.columns:
-                clean = pd.to_numeric(df[target_column], errors="coerce").dropna()
-                if len(clean) > 10:
-                    q1, q3 = clean.quantile(0.25), clean.quantile(0.75)
+                clean = df[target_column].cast(pl.Float64, strict=False).drop_nulls()
+                if clean.len() > 10:
+                    q1 = float(clean.quantile(0.25) or 0)
+                    q3 = float(clean.quantile(0.75) or 0)
                     iqr = q3 - q1
                     lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-
-                    # Safety: don't clip/remove if bounds are degenerate
                     if lower == upper or abs(upper - lower) < 0.01:
                         log.append(
                             f"⚠️ Skipped outlier handling — IQR bounds too narrow ({lower:.2f}, {upper:.2f})"
                         )
                         continue
-
                     if choice == "clip":
                         n_clipped = int(
                             ((df[target_column] < lower) | (df[target_column] > upper)).sum()
                         )
                         if n_clipped > 0:
-                            df[target_column] = df[target_column].clip(lower=lower, upper=upper)
+                            df = df.with_columns(
+                                pl.col(target_column).clip(lower_bound=lower, upper_bound=upper)
+                            )
                             log.append(
                                 f"✅ Clipped {n_clipped:,} outliers to [{lower:.2f}, {upper:.2f}]"
                             )
@@ -823,9 +831,11 @@ def apply_preparation(
                                 f"ℹ️ No outliers to clip (bounds: [{lower:.2f}, {upper:.2f}])"
                             )
                     elif choice == "remove":
-                        before = len(df)
-                        df = df[(df[target_column] >= lower) & (df[target_column] <= upper)]
-                        removed = before - len(df)
+                        before = df.height
+                        df = df.filter(
+                            (pl.col(target_column) >= lower) & (pl.col(target_column) <= upper)
+                        )
+                        removed = before - df.height
                         if removed > 0:
                             log.append(f"✅ Removed {removed:,} outlier rows")
                         else:
@@ -833,20 +843,21 @@ def apply_preparation(
 
         elif step.id == "handle_duplicates" and choice != "skip":
             if datetime_column in df.columns:
-                before = len(df)
+                before = df.height
+                grp = group_cols or []
                 if choice == "aggregate_mean":
-                    # Preserve grouping columns if present
-                    group_cols = group_cols or []
-                    agg_cols = [datetime_column] + [c for c in group_cols if c in df.columns]
-                    if agg_cols:
-                        df = df.groupby(agg_cols).mean(numeric_only=True).reset_index()
-                    else:
-                        df = df.groupby(datetime_column).mean(numeric_only=True).reset_index()
-                elif choice == "keep_last":
-                    subset_cols = [datetime_column] + [
-                        c for c in (group_cols or []) if c in df.columns
+                    agg_cols = [datetime_column] + [c for c in grp if c in df.columns]
+                    num_cols = [
+                        c for c in df.columns if c not in agg_cols and df[c].dtype.is_numeric()
                     ]
-                    df = df.drop_duplicates(subset=subset_cols, keep="last")
-                log.append(f"✅ Handled duplicates: {before:,} → {len(df):,} rows")
+                    df = (
+                        df.group_by(agg_cols)
+                        .agg([pl.col(c).mean() for c in num_cols])
+                        .sort(datetime_column)
+                    )
+                elif choice == "keep_last":
+                    subset_cols = [datetime_column] + [c for c in grp if c in df.columns]
+                    df = df.unique(subset=subset_cols, keep="last")
+                log.append(f"✅ Handled duplicates: {before:,} → {df.height:,} rows")
 
     return df, log

@@ -3,11 +3,9 @@ Training tasks — async model training via Celery.
 """
 
 import asyncio
-import io
 import logging
 from uuid import UUID
 
-import pandas as pd
 from sqlalchemy import select
 
 from app.db.models import Dataset, ModelRun, PipelineStep
@@ -50,6 +48,7 @@ async def _run_training_task(model_run_id: str) -> None:
     """
     from app.services.model_service import ModelService
     from app.storage.blob import get_blob_storage
+    from forecaster.utils.tabular import read_df_from_bytes
 
     async with async_session_factory() as db:
         try:
@@ -64,10 +63,7 @@ async def _run_training_task(model_run_id: str) -> None:
             blob = get_blob_storage()
             try:
                 data_bytes = blob.download_bytes("datasets", dataset.blob_path)
-                if dataset.blob_path.endswith(".parquet"):
-                    df = pd.read_parquet(io.BytesIO(data_bytes))
-                else:
-                    df = pd.read_csv(io.BytesIO(data_bytes))
+                df = read_df_from_bytes(data_bytes, path_hint=dataset.blob_path or "")
             except Exception as blob_err:
                 raise ValueError(
                     f"Cannot load dataset from blob: {dataset.blob_path}"
@@ -84,6 +80,7 @@ async def _run_training_task(model_run_id: str) -> None:
 async def _run_agent_pipeline_task(model_run_id: str) -> None:
     from app.services.pipeline_service import PipelineService
     from app.storage.blob import get_blob_storage
+    from forecaster.utils.tabular import read_df_from_bytes
 
     async with async_session_factory() as db:
         try:
@@ -97,10 +94,7 @@ async def _run_agent_pipeline_task(model_run_id: str) -> None:
 
             blob = get_blob_storage()
             data_bytes = blob.download_bytes("datasets", dataset.blob_path)
-            if dataset.blob_path.endswith(".parquet"):
-                df = pd.read_parquet(io.BytesIO(data_bytes))
-            else:
-                df = pd.read_csv(io.BytesIO(data_bytes))
+            df = read_df_from_bytes(data_bytes, path_hint=dataset.blob_path or "")
 
             await PipelineService.run(UUID(model_run_id), df, db)
             await db.commit()

@@ -9,10 +9,11 @@ Implements state-of-the-art time series model analysis:
 - Health score calculation
 """
 
+from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 
 def calculate_residuals(actual: list[float], predicted: list[float]) -> dict[str, Any]:
@@ -108,7 +109,7 @@ def calculate_baseline_metrics(
 
 
 def analyze_data_quality(
-    df: pd.DataFrame, datetime_column: str, target_column: str
+    df: pl.DataFrame, datetime_column: str, target_column: str
 ) -> dict[str, Any]:
     """
     Analyze training data quality.
@@ -119,8 +120,8 @@ def analyze_data_quality(
     quality = {}
 
     # Missing values
-    total_rows = len(df)
-    missing_target = df[target_column].isna().sum()
+    total_rows = df.height
+    missing_target = df[target_column].null_count() if target_column in df.columns else 0
     missing_pct = float((missing_target / total_rows) * 100) if total_rows > 0 else 0.0
 
     quality["total_rows"] = total_rows
@@ -129,12 +130,13 @@ def analyze_data_quality(
 
     # Outliers (Z-score > 3)
     if target_column in df.columns:
-        values = df[target_column].dropna()
+        values = df[target_column].cast(pl.Float64, strict=False).drop_nulls()
         if len(values) > 0:
             mean_val = float(values.mean())
-            std_val = float(values.std())
+            std_val = float(values.std() or 0.0)
             if std_val > 0:
-                z_scores = np.abs((values - mean_val) / std_val)
+                arr = values.to_numpy()
+                z_scores = np.abs((arr - mean_val) / std_val)
                 outliers = int((z_scores > 3).sum())
                 quality["outliers_count"] = outliers
                 quality["outliers_pct"] = float((outliers / len(values)) * 100)
@@ -145,21 +147,26 @@ def analyze_data_quality(
     # Data recency
     if datetime_column in df.columns:
         try:
-            df_sorted = df.sort_values(datetime_column)
-            last_date = pd.to_datetime(df_sorted[datetime_column].iloc[-1])
-            now = pd.Timestamp.now()
-            days_old = (now - last_date).days
+            df_sorted = df.sort(datetime_column)
+            last_val = df_sorted[datetime_column][-1]
+            last_dt = (
+                last_val
+                if isinstance(last_val, datetime)
+                else datetime.fromisoformat(str(last_val))
+            )
+            now = datetime.now(UTC).replace(tzinfo=None)
+            days_old = (now - last_dt.replace(tzinfo=None)).days
             quality["data_age_days"] = int(days_old)
-            quality["last_data_date"] = str(last_date.date())
+            quality["last_data_date"] = str(last_dt.date())
         except Exception:
             quality["data_age_days"] = None
 
     # Basic statistics
     if target_column in df.columns:
-        values = df[target_column].dropna()
+        values = df[target_column].cast(pl.Float64, strict=False).drop_nulls()
         if len(values) > 0:
             quality["mean"] = float(values.mean())
-            quality["std"] = float(values.std())
+            quality["std"] = float(values.std() or 0.0)
             quality["min"] = float(values.min())
             quality["max"] = float(values.max())
 

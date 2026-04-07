@@ -106,7 +106,7 @@ async def _load_active_dataset_into_session(
     try:
         blob = get_blob_storage()
         df = blob.download_df("datasets", ds.blob_path)
-        col_infos = [ColumnInfo(name=col, dtype=str(dt)) for col, dt in df.dtypes.items()]
+        col_infos = [ColumnInfo(name=c, dtype=str(df[c].dtype)) for c in df.columns]
         srcs = ds.data_sources or []
         src = srcs[0] if srcs else None
         chat_session.data_info = DataInfo(
@@ -340,6 +340,7 @@ async def _apply_data_op(
     from app.storage.blob import get_blob_storage
     from app.db.session import async_session_factory
     from forecaster.agents.data_operations_v2 import DataOperations
+    from forecaster.utils.tabular import schema_dtype_map
 
     blob = get_blob_storage()
     ops = DataOperations()
@@ -384,12 +385,12 @@ async def _apply_data_op(
                     new_df = result["dataframe"]
                     blob.upload_df("datasets", ds.blob_path, new_df)
                     schema = dict(ds.schema_json or {})
-                    for col, dt in new_df.dtypes.items():
+                    for col, dt in schema_dtype_map(new_df).items():
                         if not str(col).startswith("__"):
-                            schema[str(col)] = str(dt)
+                            schema[str(col)] = dt
                     ds.schema_json = schema
-                    ds.row_count = len(new_df)
-                    ds.column_count = len(new_df.columns)
+                    ds.row_count = new_df.height
+                    ds.column_count = new_df.width
                     await own_db.flush()
                     return True
                 except Exception as e:

@@ -14,7 +14,7 @@ import json
 import sys
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 from forecaster.core.context import ContextWindow, ResourceBudget
 from forecaster.core.pipeline import ForecastOrchestrator
@@ -99,18 +99,18 @@ def main() -> None:
     print(f"\n[FORECASTER] Loading data from {data_path}...")
     try:
         if data_path.suffix == ".csv":
-            df = pd.read_csv(data_path)
+            df = pl.read_csv(data_path)
         elif data_path.suffix in (".xlsx", ".xls"):
-            df = pd.read_excel(data_path)
+            df = pl.read_excel(data_path)
         elif data_path.suffix == ".parquet":
-            df = pd.read_parquet(data_path)
+            df = pl.read_parquet(data_path)
         else:
-            df = pd.read_csv(data_path)
+            df = pl.read_csv(data_path)
     except Exception as e:
         print(f"Error loading file: {e}")
         sys.exit(1)
 
-    print(f"  Loaded: {len(df)} rows, {len(df.columns)} columns")
+    print(f"  Loaded: {df.height} rows, {df.width} columns")
     print(f"  Columns: {list(df.columns)}")
 
     # Build context

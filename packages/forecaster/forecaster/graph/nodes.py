@@ -15,7 +15,7 @@ import time
 from typing import Any
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from langgraph.types import interrupt
 
 from forecaster.graph.state import ForecastGraphState
@@ -32,7 +32,7 @@ def _prog(text: str, step: str, status: str = "info") -> dict:
     return {"text": text, "step": step, "status": status, "ts": _ts()}
 
 
-def _get_df(state: ForecastGraphState) -> pd.DataFrame:
+def _get_df(state: ForecastGraphState) -> pl.DataFrame:
     """Return prepared_dataframe if available, else original dataframe."""
     prepared = state.get("prepared_dataframe")
     if prepared is not None:
@@ -64,7 +64,7 @@ def analyze_data(state: ForecastGraphState) -> dict:
     from forecaster.core.context import ContextWindow, ResourceBudget
 
     t0 = _ts()
-    df: pd.DataFrame = state["dataframe"]
+    df: pl.DataFrame = state["dataframe"]
     datetime_column = state["datetime_column"]
     target_column = state["target_column"]
     group_columns = state["group_columns"]
@@ -156,7 +156,7 @@ def analyze_data(state: ForecastGraphState) -> dict:
         col
         for col in df.columns
         if col not in reserved
-        and pd.api.types.is_numeric_dtype(df[col])
+        and df[col].dtype.is_numeric()
         and not col.startswith("Unnamed")
         and col != "index"
     ]
@@ -228,7 +228,7 @@ def analyze_data(state: ForecastGraphState) -> dict:
         details.append("No future exog data provided — using autoregressive features only")
 
     duration = _ts() - t0
-    n_rows = wizard_analysis.get("n_rows", len(df))
+    n_rows = wizard_analysis.get("n_rows", df.height)
 
     return {
         "data_profile": data_profile_dict,
@@ -252,7 +252,7 @@ def prepare_data(state: ForecastGraphState) -> dict:
     from forecaster.agents.forecast_wizard import apply_preparation, suggest_preparations
 
     t0 = _ts()
-    df: pd.DataFrame = state["dataframe"]
+    df: pl.DataFrame = state["dataframe"]
     analysis = state.get("analysis_data") or {}
     datetime_column = state["datetime_column"]
     target_column = state["target_column"]
@@ -269,12 +269,11 @@ def prepare_data(state: ForecastGraphState) -> dict:
         if analysis.get("clip_negatives") and target_column in prepared_df.columns:
             n_neg = int((prepared_df[target_column] < 0).sum())
             if n_neg > 0:
-                prepared_df = prepared_df.copy()
-                prepared_df[target_column] = prepared_df[target_column].clip(lower=0)
+                prepared_df = prepared_df.with_columns(pl.col(target_column).clip(lower_bound=0))
                 prep_log.append(f"Clipped {n_neg:,} negative values to 0 (user confirmed)")
 
         details = prep_log if prep_log else ["Data is clean — no preparation needed"]
-        msg = f"Prepared ({len(prepared_df):,} rows)"
+        msg = f"Prepared ({prepared_df.height:,} rows)"
 
         return {
             "prepared_dataframe": prepared_df,
@@ -286,7 +285,7 @@ def prepare_data(state: ForecastGraphState) -> dict:
     except Exception as e:
         print(f"[graph/prepare_data] {e}", file=sys.stderr)
         return {
-            "prepared_dataframe": df.copy(),
+            "prepared_dataframe": df.clone(),
             "step_results": {
                 "preparation": _step(
                     "failed", f"Preparation failed — using original: {e}", [str(e)], _ts() - t0
@@ -655,7 +654,7 @@ def generate_forecast(state: ForecastGraphState) -> dict:
     from forecaster.models.mlforecast_models import MLForecastModel
 
     t0 = _ts()
-    df: pd.DataFrame = state["dataframe"]
+    df: pl.DataFrame = state["dataframe"]
     train_df = _get_df(state)
     best_model = state.get("trained_model")
     best_name = state.get("best_model_name") or "naive"
@@ -688,27 +687,29 @@ def generate_forecast(state: ForecastGraphState) -> dict:
     try:
         if isinstance(best_model, MLForecastModel):
             pred_df = best_model.predict(horizon)
-            predictions: list[float] = pred_df["prediction"].tolist()
+            predictions: list[float] = pred_df["prediction"].to_list()
             if "datetime" in pred_df.columns:
-                dates: list[str] = pred_df["datetime"].astype(str).tolist()
+                dates: list[str] = [str(d) for d in pred_df["datetime"].to_list()]
             elif "ds" in pred_df.columns:
-                dates = pred_df["ds"].astype(str).tolist()
+                dates = [str(d) for d in pred_df["ds"].to_list()]
             else:
                 dates = [str(i) for i in range(len(predictions))]
 
             if group_columns and "unique_id" in pred_df.columns:
                 group_info = {
-                    "groups": pred_df["unique_id"].unique().tolist(),
-                    "n_groups": pred_df["unique_id"].nunique(),
+                    "groups": pred_df["unique_id"].unique().to_list(),
+                    "n_groups": pred_df["unique_id"].n_unique(),
                     "group_columns": group_columns,
                 }
         else:
-            # Simple models (Naive, Linear)
-            proc_df = train_df.copy()
-            proc_df[datetime_column] = pd.to_datetime(proc_df[datetime_column], errors="coerce")
-            proc_df = proc_df.dropna(subset=[datetime_column]).set_index(datetime_column)
-            proc_df = proc_df[[target_column]].rename(columns={target_column: "value"})
-            proc_df = proc_df.sort_index().dropna()
+            # Simple models (Naive, Linear) — pass Polars DataFrame directly
+            proc_df = (
+                train_df.with_columns(pl.col(datetime_column).cast(pl.Datetime, strict=False))
+                .drop_nulls(datetime_column)
+                .select([datetime_column, pl.col(target_column).alias("value")])
+                .sort(datetime_column)
+                .drop_nulls("value")
+            )
             best_model.fit(proc_df)
             simple_result = best_model.predict(horizon)
             predictions = simple_result.predictions
@@ -751,7 +752,7 @@ def generate_forecast(state: ForecastGraphState) -> dict:
     }
 
     data_quality = analyze_data_quality(df, datetime_column, target_column)
-    historical = df[target_column].dropna().tolist() if target_column in df.columns else []
+    historical = df[target_column].drop_nulls().to_list() if target_column in df.columns else []
     sanity = check_forecast_sanity(predictions, historical, target_column)
     residual_analysis = {"is_random": True, "autocorr_lag1": 0.0, "has_trend": False}
 
@@ -800,13 +801,16 @@ def generate_forecast(state: ForecastGraphState) -> dict:
 
             for gid in group_info.get("groups", []) if group_info else []:
                 try:
-                    uid_col = "_uid_tmp"
-                    gdf = df.copy()
-                    gdf[uid_col] = gdf[group_columns].astype(str).agg("_".join, axis=1)
-                    gdf = gdf[gdf[uid_col] == gid].sort_values(datetime_column)
-                    actual_vals = (
-                        pd.to_numeric(gdf[target_column], errors="coerce").dropna().tolist()
+                    uid_expr = pl.concat_str(
+                        [pl.col(c).cast(pl.Utf8) for c in group_columns], separator="_"
                     )
+                    gdf = (
+                        df.filter(uid_expr == gid)
+                        .sort(datetime_column)
+                        .with_columns(pl.col(target_column).cast(pl.Float64, strict=False))
+                        .drop_nulls(target_column)
+                    )
+                    actual_vals = gdf[target_column].to_list()
                     if len(actual_vals) < 20:
                         continue
 
@@ -816,7 +820,7 @@ def generate_forecast(state: ForecastGraphState) -> dict:
                     res = calculate_residuals(test_act, naive_preds)
 
                     test_dates = (
-                        gdf[datetime_column].iloc[split:].astype(str).tolist()
+                        [str(d) for d in gdf[datetime_column].slice(split).to_list()]
                         if datetime_column in gdf.columns
                         else []
                     )

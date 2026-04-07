@@ -1,5 +1,5 @@
 """
-FeatureEngineerAgent — generates feature specifications based on data profile.
+FeatureEngineerAgent — generates feature specifications based on data profile (Polars).
 
 Pure function: reads DataProfile from context, produces list[FeatureSpec].
 Does NOT mutate the DataFrame — only specifies WHAT features to create.
@@ -9,7 +9,7 @@ Actual feature creation happens downstream (e.g., during model training).
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from forecaster.agents.base import BaseAgent
 from forecaster.core.context import (
@@ -28,7 +28,7 @@ class FeatureEngineerAgent(BaseAgent):
       - Rolling statistics (7d mean/std)
       - Date-part features (day_of_week, month, is_weekend)
       - Holiday flags (if holidays_pl in context.data_registry)
-      - SHAP-based impact preview on sample (optional)
+      - Correlation-based impact preview on sample (optional)
     """
 
     name: str = "feature_engineer"
@@ -47,7 +47,6 @@ class FeatureEngineerAgent(BaseAgent):
 
         specs: list[FeatureSpec] = []
 
-        # 1. Lag features
         lag_values = self._select_lags(profile)
         for lag in lag_values:
             specs.append(
@@ -59,7 +58,6 @@ class FeatureEngineerAgent(BaseAgent):
                 )
             )
 
-        # 2. Rolling statistics
         windows = self._select_rolling_windows(profile)
         for w in windows:
             specs.append(
@@ -79,7 +77,6 @@ class FeatureEngineerAgent(BaseAgent):
                 )
             )
 
-        # 3. Date-part features
         date_features = self._select_date_features(profile)
         for feat_name, params in date_features:
             specs.append(
@@ -91,7 +88,6 @@ class FeatureEngineerAgent(BaseAgent):
                 )
             )
 
-        # 4. Holiday features (if available)
         if "holidays_pl" in context.data_registry:
             specs.append(
                 FeatureSpec(
@@ -102,12 +98,9 @@ class FeatureEngineerAgent(BaseAgent):
                 )
             )
 
-        # 5. Compute SHAP preview on sample (lightweight)
-        specs = self._estimate_shap_impacts(specs, context)
-
+        specs = self._estimate_impacts(specs, context)
         context.feature_specs = specs
 
-        # Resource estimates
         n_features = len(specs)
         est_compute = 0.1 * n_features
         est_memory = max(10, 2 * n_features)
@@ -131,55 +124,61 @@ class FeatureEngineerAgent(BaseAgent):
 
         return context, decision
 
-    # -- Feature creation (materialize specs into DataFrame) ---------------
-
     @staticmethod
     def apply_features(
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         specs: list[FeatureSpec],
         datetime_column: str,
         target_column: str,
-        holidays_df: pd.DataFrame | None = None,
-    ) -> pd.DataFrame:
+        holidays_df: pl.DataFrame | None = None,
+    ) -> pl.DataFrame:
         """
-        Materialize feature specs into actual DataFrame columns.
+        Materialize feature specs into actual DataFrame columns (Polars).
 
-        This is a pure function — does not modify the original DataFrame.
-        Called by the orchestrator after the agent produces specs.
+        Pure function — does not modify the original DataFrame.
         """
-        result = df.copy()
+        result = df.clone()
 
-        # Ensure datetime is proper type
-        if datetime_column in result.columns:
-            result[datetime_column] = pd.to_datetime(result[datetime_column])
+        if datetime_column in result.columns and not result[datetime_column].dtype.is_temporal():
+            result = result.with_columns(pl.col(datetime_column).cast(pl.Datetime, strict=False))
 
         for spec in specs:
             try:
                 if spec.feature_type == "lag" and target_column in result.columns:
                     lag = spec.parameters.get("lag", 1)
-                    result[spec.name] = result[target_column].shift(lag)
+                    result = result.with_columns(pl.col(target_column).shift(lag).alias(spec.name))
 
                 elif spec.feature_type == "rolling_mean" and target_column in result.columns:
                     w = spec.parameters.get("window", 7)
-                    result[spec.name] = result[target_column].rolling(window=w).mean()
+                    result = result.with_columns(
+                        pl.col(target_column)
+                        .rolling_mean(window_size=w, min_periods=1)
+                        .alias(spec.name)
+                    )
 
                 elif spec.feature_type == "rolling_std" and target_column in result.columns:
                     w = spec.parameters.get("window", 7)
-                    result[spec.name] = result[target_column].rolling(window=w).std()
+                    result = result.with_columns(
+                        pl.col(target_column)
+                        .rolling_std(window_size=w, min_periods=1)
+                        .alias(spec.name)
+                    )
 
                 elif spec.feature_type == "date_part" and datetime_column in result.columns:
-                    dt = result[datetime_column]
                     part = spec.parameters.get("part")
+                    dt = pl.col(datetime_column).cast(pl.Datetime)
                     if part == "dayofweek":
-                        result[spec.name] = dt.dt.dayofweek
+                        result = result.with_columns(dt.dt.weekday().alias(spec.name))
                     elif part == "month":
-                        result[spec.name] = dt.dt.month
+                        result = result.with_columns(dt.dt.month().alias(spec.name))
                     elif part == "day":
-                        result[spec.name] = dt.dt.day
+                        result = result.with_columns(dt.dt.day().alias(spec.name))
                     elif part == "is_weekend":
-                        result[spec.name] = (dt.dt.dayofweek >= 5).astype(int)
+                        result = result.with_columns(
+                            (dt.dt.weekday() >= 5).cast(pl.Int8).alias(spec.name)
+                        )
                     elif part == "quarter":
-                        result[spec.name] = dt.dt.quarter
+                        result = result.with_columns(dt.dt.quarter().alias(spec.name))
 
                 elif spec.feature_type == "holiday":
                     if holidays_df is not None and datetime_column in result.columns:
@@ -187,21 +186,16 @@ class FeatureEngineerAgent(BaseAgent):
                             result, holidays_df, datetime_column, spec.name
                         )
                     else:
-                        result[spec.name] = 0
+                        result = result.with_columns(pl.lit(0).alias(spec.name))
 
             except Exception:
-                # Skip features that fail gracefully
-                result[spec.name] = np.nan
+                result = result.with_columns(pl.lit(None).cast(pl.Float64).alias(spec.name))
 
         return result
 
-    # -- Internal helpers --------------------------------------------------
-
     @staticmethod
     def _select_lags(profile) -> list[int]:
-        """Select lag values based on data characteristics."""
-        lags = [1]  # Always include lag-1
-
+        lags = [1]
         freq = profile.frequency
         if freq == "D":
             lags.extend([7, 14, 30])
@@ -210,17 +204,14 @@ class FeatureEngineerAgent(BaseAgent):
         elif freq == "M":
             lags.extend([3, 6, 12])
         elif freq and "h" in freq:
-            lags.extend([24, 168])  # daily, weekly in hours
+            lags.extend([24, 168])
         else:
             lags.extend([7, 30])
-
-        # Filter lags that are too large for the data
         max_lag = max(1, profile.n_rows // 3)
-        return sorted({l for l in lags if l <= max_lag})  # noqa: E741
+        return sorted({la for la in lags if la <= max_lag})
 
     @staticmethod
     def _select_rolling_windows(profile) -> list[int]:
-        """Select rolling window sizes."""
         freq = profile.frequency
         if freq == "D":
             windows = [7, 14, 30]
@@ -230,16 +221,13 @@ class FeatureEngineerAgent(BaseAgent):
             windows = [3, 6]
         else:
             windows = [7, 14]
-
         max_w = max(1, profile.n_rows // 4)
         return [w for w in windows if w <= max_w]
 
     @staticmethod
     def _select_date_features(profile) -> list[tuple[str, dict]]:
-        """Select relevant date-part features."""
         features = []
         freq = profile.frequency
-
         if freq in ("D", None) or (freq and ("h" in freq or "min" in freq)):
             features.append(("day_of_week", {"part": "dayofweek"}))
             features.append(("is_weekend", {"part": "is_weekend"}))
@@ -247,12 +235,10 @@ class FeatureEngineerAgent(BaseAgent):
             features.append(("month", {"part": "month"}))
         if freq in ("D", None):
             features.append(("day_of_month", {"part": "day"}))
-
         return features
 
     @staticmethod
     def _estimate_lag_impact(lag: int, profile) -> float:
-        """Rough estimate of lag feature importance."""
         if lag == 1:
             return 0.6
         if profile.has_seasonality and profile.seasonality_period == lag:
@@ -261,93 +247,84 @@ class FeatureEngineerAgent(BaseAgent):
             return 0.35
         return 0.2
 
-    def _estimate_shap_impacts(
+    def _estimate_impacts(
         self, specs: list[FeatureSpec], context: ContextWindow
     ) -> list[FeatureSpec]:
-        """
-        Lightweight SHAP-inspired impact estimation on a small sample.
-        Falls back to heuristic estimates if data is insufficient.
-        """
+        """Correlation-based impact estimation on a small sample."""
         df = context.get_primary_data()
         target = context.target_column
 
-        if df is None or target is None or len(df) < 50:
-            return specs  # Keep heuristic estimates
+        if df is None or target is None or df.height < 50:
+            return specs
 
         try:
-            # Use correlation as a quick proxy for importance
-            sample = df.head(min(500, len(df))).copy()
+            sample_size = min(500, df.height)
+            sample = df.head(sample_size)
             if target not in sample.columns:
                 return specs
 
             dt_col = context.datetime_column
-            if dt_col and dt_col in sample.columns:
-                sample[dt_col] = pd.to_datetime(sample[dt_col])
-
-            # Create temp features and measure correlation
             materialized = self.apply_features(sample, specs, dt_col or "", target)
 
-            target_series = materialized[target].dropna()
+            target_arr = materialized[target].drop_nulls().to_numpy().astype(float)
             for spec in specs:
                 if spec.name in materialized.columns:
-                    feat_series = materialized[spec.name].dropna()
-                    common_idx = target_series.index.intersection(feat_series.index)
-                    if len(common_idx) > 10:
-                        corr = abs(target_series.loc[common_idx].corr(feat_series.loc[common_idx]))
+                    feat_arr = materialized[spec.name].drop_nulls().to_numpy().astype(float)
+                    n = min(len(target_arr), len(feat_arr))
+                    if n > 10:
+                        corr = float(np.corrcoef(target_arr[:n], feat_arr[:n])[0, 1])
                         if not np.isnan(corr):
-                            spec.estimated_impact = round(corr, 3)
+                            spec.estimated_impact = round(abs(corr), 3)
         except Exception:
-            pass  # Keep heuristic estimates
+            pass
 
         return specs
 
     @staticmethod
     def _build_reasoning(specs: list[FeatureSpec], profile) -> str:
         parts = [f"Generated {len(specs)} features"]
-
         lag_specs = [s for s in specs if s.feature_type == "lag"]
         if lag_specs:
             parts.append(f"lags [{','.join(str(s.parameters.get('lag', '?')) for s in lag_specs)}]")
-
-        rolling_specs = [s for s in specs if "rolling" in s.feature_type]
-        if rolling_specs:
-            parts.append(f"{len(rolling_specs)} rolling stats")
-
-        date_specs = [s for s in specs if s.feature_type == "date_part"]
-        if date_specs:
-            parts.append(f"{len(date_specs)} date features")
-
-        holiday_specs = [s for s in specs if s.feature_type == "holiday"]
-        if holiday_specs:
+        rolling = [s for s in specs if "rolling" in s.feature_type]
+        if rolling:
+            parts.append(f"{len(rolling)} rolling stats")
+        date_s = [s for s in specs if s.feature_type == "date_part"]
+        if date_s:
+            parts.append(f"{len(date_s)} date features")
+        holiday_s = [s for s in specs if s.feature_type == "holiday"]
+        if holiday_s:
             parts.append("holiday flags")
-
         return "; ".join(parts) + "."
 
 
 def _apply_holiday_feature(
-    df: pd.DataFrame,
-    holidays_df: pd.DataFrame,
+    df: pl.DataFrame,
+    holidays_df: pl.DataFrame,
     datetime_column: str,
     feature_name: str,
-) -> pd.DataFrame:
-    """Join holiday flags onto the main DataFrame."""
-    result = df.copy()
+) -> pl.DataFrame:
+    """Join holiday flags onto the main DataFrame (Polars)."""
     try:
-        # Find date column in holidays
-        hol_date_col = None
-        for c in holidays_df.columns:
-            if "date" in c.lower() or pd.api.types.is_datetime64_any_dtype(holidays_df[c]):
-                hol_date_col = c
-                break
+        hol_date_col = next(
+            (
+                c
+                for c in holidays_df.columns
+                if "date" in c.lower() or holidays_df[c].dtype.is_temporal()
+            ),
+            None,
+        )
         if hol_date_col is None:
-            result[feature_name] = 0
-            return result
+            return df.with_columns(pl.lit(0).alias(feature_name))
 
-        hol_dates = set(pd.to_datetime(holidays_df[hol_date_col]).dt.normalize())
-        result[feature_name] = (
-            pd.to_datetime(result[datetime_column]).dt.normalize().isin(hol_dates).astype(int)
+        hol_dates = holidays_df[hol_date_col].cast(pl.Date, strict=False).drop_nulls().unique()
+        hol_set = set(hol_dates.to_list())
+
+        return df.with_columns(
+            pl.col(datetime_column)
+            .cast(pl.Date, strict=False)
+            .map_elements(lambda d: int(d in hol_set), return_dtype=pl.Int8)
+            .alias(feature_name)
         )
     except Exception:
-        result[feature_name] = 0
-
-    return result
+        return df.with_columns(pl.lit(0).alias(feature_name))

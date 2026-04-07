@@ -35,7 +35,7 @@ class ForecastGraphState(TypedDict):
     frequency: str | None  # may be updated by analyze_data node once
 
     # ── Data (DataFrames — in-memory only, not JSON-serialisable) ────────────
-    dataframe: Any  # original pd.DataFrame from the user
+    dataframe: Any  # original pl.DataFrame from the user
     prepared_dataframe: Any | None
     future_exog_df: Any | None  # uploaded future exogenous values
 

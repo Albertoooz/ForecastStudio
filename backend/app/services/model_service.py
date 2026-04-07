@@ -9,7 +9,7 @@ import pickle
 import time
 from uuid import UUID
 
-import pandas as pd
+import polars as pl
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,7 +25,7 @@ class ModelService:
     @staticmethod
     async def run_training(
         model_run_id: UUID,
-        df: pd.DataFrame,
+        df: pl.DataFrame,
         db: AsyncSession,
     ) -> ModelRun:
         """
@@ -202,8 +202,12 @@ class ModelService:
 
             if isinstance(model, MLForecastModel):
                 pred_df = model.predict(horizon)
-                dates = pred_df.get("ds", pred_df.get("datetime", pd.Series())).astype(str).tolist()
-                predictions = pred_df["prediction"].tolist()
+                date_col = "datetime" if "datetime" in pred_df.columns else "ds"
+                if date_col in pred_df.columns:
+                    dates = [str(d) for d in pred_df[date_col].to_list()]
+                else:
+                    dates = [str(i) for i in range(horizon)]
+                predictions = pred_df["prediction"].to_list()
             else:
                 simple = model.predict(horizon)
                 dates = simple.dates

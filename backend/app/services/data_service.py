@@ -1,38 +1,57 @@
 """
 Data Service — business logic for dataset operations.
 
-Wraps upload, validation, schema detection, transformation.
-Re-uses forecaster.data.loader and forecaster.data.analyzer.
+Upload, validation, schema detection, transformation (Polars).
 """
 
-import io
-from typing import cast
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, cast
 from uuid import UUID
 
-import pandas as pd
+import polars as pl
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.connectors.csv_upload import read_upload_bytes
 from app.db.models import Dataset
+
+
+def _infer_frequency_from_sorted_datetimes(series: pl.Series) -> str | None:
+    """Best-effort frequency label from median delta (Polars-only)."""
+    if series.len() < 3:
+        return None
+    deltas = series.diff().dt.total_seconds().drop_nulls()
+    if deltas.len() == 0:
+        return None
+    med_raw = deltas.median()
+    med = float(cast(Any, med_raw)) if med_raw is not None else 0.0
+    if med <= 0:
+        return None
+    day = 86400.0
+    hour = 3600.0
+    if abs(med - day) < 1800:
+        return "D"
+    if abs(med - hour) < 120:
+        return "H"
+    if abs(med - 7 * day) < 12 * hour:
+        return "W"
+    if day * 25 <= med <= day * 35:
+        return "M"
+    return None
 
 
 class DataService:
     """Stateless service — each method receives a DB session."""
 
-    # ── Upload / Load ────────────────────────────────────────────────────
-
     @staticmethod
-    def read_file(content: bytes, filename: str) -> pd.DataFrame:
+    def read_file(content: bytes, filename: str) -> pl.DataFrame:
         """Parse raw bytes → DataFrame."""
-        if filename.endswith((".xlsx", ".xls")):
-            return pd.read_excel(io.BytesIO(content))
-        elif filename.endswith(".parquet"):
-            return pd.read_parquet(io.BytesIO(content))
-        else:
-            return pd.read_csv(io.BytesIO(content))
+        return read_upload_bytes(filename, content)
 
     @staticmethod
-    def detect_schema(df: pd.DataFrame) -> dict:
+    def detect_schema(df: pl.DataFrame) -> dict:
         """Auto-detect column types and time-series structure."""
         schema: dict = {
             "columns": {},
@@ -41,119 +60,151 @@ class DataService:
             "categorical_columns": [],
         }
         for col in df.columns:
-            dtype = str(df[col].dtype)
-            schema["columns"][col] = dtype
-            if "datetime" in dtype or "date" in col.lower() or "time" in col.lower():
+            dtype = df[col].dtype
+            schema["columns"][col] = str(dtype)
+            if dtype.is_temporal():
                 schema["datetime_candidates"].append(col)
-            elif df[col].dtype.kind in ("i", "f"):
+            elif dtype.is_numeric():
                 schema["numeric_columns"].append(col)
             else:
-                schema["categorical_columns"].append(col)
-
-        # Try to parse potential datetime columns
-        for col in list(schema["categorical_columns"]):
-            try:
-                pd.to_datetime(df[col].head(5))
-                schema["datetime_candidates"].append(col)
-            except Exception:
-                pass
+                cl = col.lower()
+                if "date" in cl or "time" in cl or cl == "ds":
+                    schema["datetime_candidates"].append(col)
+                else:
+                    schema["categorical_columns"].append(col)
 
         return schema
 
     @staticmethod
-    def detect_frequency(df: pd.DataFrame, datetime_col: str) -> str | None:
-        """Infer time series frequency."""
+    def detect_frequency(df: pl.DataFrame, datetime_col: str) -> str | None:
+        """Infer time series frequency from sorted timestamp deltas."""
         try:
-            ts = pd.to_datetime(df[datetime_col]).sort_values()
-            freq = pd.infer_freq(ts)
-            return cast(str | None, freq)
+            s = df.sort(datetime_col)[datetime_col]
+            return _infer_frequency_from_sorted_datetimes(s)
         except Exception:
             return None
 
     @staticmethod
-    def compute_summary(df: pd.DataFrame) -> dict:
+    def compute_summary(df: pl.DataFrame) -> dict:
         """Compute dataset summary statistics."""
+        n = df.height or 1
+        missing = {c: int(df[c].null_count()) for c in df.columns}
+        missing_pct = {c: round(100.0 * missing[c] / n, 2) for c in df.columns}
+        describe_rows: list[dict] = []
+        try:
+            describe_rows = df.describe().to_dicts()
+        except Exception:
+            pass
         return {
-            "shape": list(df.shape),
-            "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
-            "missing": df.isnull().sum().to_dict(),
-            "missing_pct": (df.isnull().mean() * 100).round(2).to_dict(),
-            "describe": df.describe(include="all").to_dict(),
+            "shape": [df.height, df.width],
+            "dtypes": {c: str(df[c].dtype) for c in df.columns},
+            "missing": missing,
+            "missing_pct": missing_pct,
+            "describe": describe_rows,
         }
 
-    # ── Transformations ──────────────────────────────────────────────────
-
     @staticmethod
-    def apply_transform(df: pd.DataFrame, operation: str, params: dict) -> pd.DataFrame:
-        """
-        Apply a data transformation.
-        Operations: fill_missing, drop_missing, filter_date_range,
-                    combine_datetime, resample, rename_columns, etc.
-        """
+    def apply_transform(df: pl.DataFrame, operation: str, params: dict) -> pl.DataFrame:
+        """Apply a data transformation (Polars)."""
         if operation == "fill_missing":
             method = params.get("method", "ffill")
             columns = params.get("columns")
             if columns:
-                df[columns] = df[columns].fillna(method=method)
+                for col in columns:
+                    if col in df.columns:
+                        if method == "ffill":
+                            df = df.with_columns(pl.col(col).forward_fill())
+                        elif method == "bfill":
+                            df = df.with_columns(pl.col(col).backward_fill())
             else:
-                df = df.fillna(method=method)
+                if method == "ffill":
+                    df = df.fill_null(strategy="forward")
+                elif method == "bfill":
+                    df = df.fill_null(strategy="backward")
 
         elif operation == "drop_missing":
             columns = params.get("columns")
             threshold = params.get("threshold")
             if threshold:
-                df = df.dropna(thresh=int(len(df) * threshold))
+                thresh = int(len(df.columns) * float(threshold))
+                nn = pl.sum_horizontal([pl.col(c).is_not_null() for c in df.columns])
+                df = df.filter(nn >= thresh)
             elif columns:
-                df = df.dropna(subset=columns)
+                df = df.drop_nulls(subset=columns)
             else:
-                df = df.dropna()
+                df = df.drop_nulls()
 
         elif operation == "filter_date_range":
             col = params["column"]
-            df[col] = pd.to_datetime(df[col])
+            tsc = pl.col(col).cast(pl.Datetime, strict=False)
+            cond = pl.lit(True)
             if "start" in params:
-                df = df[df[col] >= params["start"]]
+                s = params["start"]
+                if isinstance(s, datetime):
+                    cond = cond & (tsc >= pl.lit(s))
+                else:
+                    cond = cond & (tsc >= pl.lit(str(s)).str.to_datetime(strict=False))
             if "end" in params:
-                df = df[df[col] <= params["end"]]
+                e = params["end"]
+                if isinstance(e, datetime):
+                    cond = cond & (tsc <= pl.lit(e))
+                else:
+                    cond = cond & (tsc <= pl.lit(str(e)).str.to_datetime(strict=False))
+            df = df.filter(cond)
 
         elif operation == "combine_datetime":
             date_col = params["date_column"]
             time_col = params["time_column"]
             target = params.get("target_column", "datetime")
-            df[target] = pd.to_datetime(df[date_col].astype(str) + " " + df[time_col].astype(str))
+            combined = (
+                pl.col(date_col).cast(pl.Utf8) + pl.lit(" ") + pl.col(time_col).cast(pl.Utf8)
+            ).str.to_datetime(strict=False)
+            df = df.with_columns(combined.alias(target))
             if params.get("drop_original", True):
-                df = df.drop(columns=[date_col, time_col])
+                df = df.drop(date_col, time_col)
 
         elif operation == "resample":
             datetime_col = params["datetime_column"]
             freq = params["frequency"]
             agg = params.get("aggregation", "mean")
-            df[datetime_col] = pd.to_datetime(df[datetime_col])
-            df = df.set_index(datetime_col).resample(freq).agg(agg).reset_index()
+            vc = params.get("value_column") or params.get("agg_column")
+            every = _pd_freq_to_polars_service(freq)
+            sorted_df = df.sort(datetime_col)
+            if vc:
+                sorted_df = sorted_df.group_by_dynamic(datetime_col, every=every).agg(
+                    _agg_expr_service(vc, agg)
+                )
+            else:
+                num_cols = [c for c in df.columns if c != datetime_col and df[c].dtype.is_numeric()]
+                if not num_cols:
+                    raise ValueError(
+                        "resample requires value_column/agg_column or numeric columns besides datetime"
+                    )
+                exprs = [_agg_expr_service(c, agg) for c in num_cols]
+                sorted_df = sorted_df.group_by_dynamic(datetime_col, every=every).agg(*exprs)
+            df = sorted_df
 
         elif operation == "rename_columns":
-            mapping = params["mapping"]  # {"old_name": "new_name", ...}
-            df = df.rename(columns=mapping)
+            mapping = params["mapping"]
+            df = df.rename(mapping)
 
         elif operation == "drop_columns":
             cols = params["columns"]
-            df = df.drop(columns=cols, errors="ignore")
+            df = df.drop(*[c for c in cols if c in df.columns])
 
         elif operation == "cast_types":
             for col, dtype in params["types"].items():
                 if dtype == "datetime":
-                    df[col] = pd.to_datetime(df[col])
+                    df = df.with_columns(pl.col(col).cast(pl.Datetime, strict=False))
                 elif dtype == "numeric":
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df = df.with_columns(pl.col(col).cast(pl.Float64, strict=False))
                 else:
-                    df[col] = df[col].astype(dtype)
+                    df = df.with_columns(pl.col(col).cast(dtype, strict=False))
 
         else:
             raise ValueError(f"Unknown operation: {operation}")
 
         return df
-
-    # ── DB helpers ───────────────────────────────────────────────────────
 
     @staticmethod
     async def get_dataset(dataset_id: UUID, tenant_id: UUID, db: AsyncSession) -> Dataset:
@@ -167,3 +218,37 @@ class DataService:
         if not dataset:
             raise ValueError(f"Dataset {dataset_id} not found")
         return dataset
+
+
+def _pd_freq_to_polars_service(frequency: str) -> str:
+    f = (frequency or "D").strip()
+    u = f.upper()
+    mapping = {
+        "D": "1d",
+        "1D": "1d",
+        "H": "1h",
+        "1H": "1h",
+        "W": "1w",
+        "M": "1mo",
+        "T": "1m",
+        "MIN": "1m",
+    }
+    return mapping.get(u, f if any(c.isdigit() for c in f) else "1d")
+
+
+def _agg_expr_service(value_column: str, agg: str) -> pl.Expr:
+    if not value_column:
+        raise ValueError("resample requires value_column or agg_column in params")
+    c = pl.col(value_column)
+    a = (agg or "mean").lower()
+    if a == "mean":
+        return c.mean()
+    if a == "sum":
+        return c.sum()
+    if a == "count":
+        return c.count()
+    if a == "min":
+        return c.min()
+    if a == "max":
+        return c.max()
+    raise ValueError(f"Unknown aggregation: {agg}")

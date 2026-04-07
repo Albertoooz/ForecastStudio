@@ -180,7 +180,7 @@ def _register_data_tools(r: ToolRegistry):
             "parameters": {"column_name": column_name, "expression": expression},
         },
         description=(
-            "Create a new calculated column using a pandas expression. "
+            "Create a new calculated column using a Polars expression (e.g. pl.col('a') + pl.col('b')). "
             "For grouped data use df.groupby(...)['col'].transform(func). "
             "Example: df['price'] * df['quantity']"
         ),

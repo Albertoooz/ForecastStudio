@@ -2,7 +2,7 @@
 
 from typing import Any
 
-import pandas as pd
+import polars as pl
 
 from forecaster.agents.planner import ForecastingPlanner
 from forecaster.data import load_time_series, validate_time_series
@@ -20,7 +20,7 @@ class ForecastingConversation:
 
     def __init__(self, planner: ForecastingPlanner | None = None):
         self.planner = planner or ForecastingPlanner()
-        self.current_data: pd.DataFrame | None = None
+        self.current_data: pl.DataFrame | None = None
         self.current_model = None
 
     def load_data(self, path: str, **kwargs) -> dict[str, Any]:
@@ -44,7 +44,7 @@ class ForecastingConversation:
                 "success": True,
                 "message": "Data loaded successfully",
                 "validation": validation,
-                "n_points": len(df),
+                "n_points": df.height,
             }
         except Exception as e:
             return {
@@ -83,7 +83,7 @@ class ForecastingConversation:
         planner_input = {
             "user_request": user_request,
             "data_summary": validation,
-            "n_points": len(self.current_data),
+            "n_points": self.current_data.height,
         }
 
         plan_response = self.planner.process(planner_input)

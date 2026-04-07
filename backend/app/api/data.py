@@ -2,11 +2,11 @@
 Data API — Upload, preview, transform, list, delete datasets.
 """
 
-import io
 from datetime import datetime
+from typing import Any, cast
 from uuid import UUID
 
-import pandas as pd
+import polars as pl
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select, func
@@ -14,9 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.auth import get_current_user
+from app.connectors.csv_upload import read_upload_bytes
 from app.db.models import DataSource, Dataset, User
 from app.db.session import get_db
 from app.storage.blob import get_blob_storage
+from forecaster.utils.tabular import schema_dtype_map
 
 router = APIRouter()
 
@@ -83,16 +85,28 @@ class TransformResponse(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _read_upload(file: UploadFile) -> tuple[pd.DataFrame, bytes]:
+def _pl_scalar_float(v: object, default: float = 0.0) -> float:
+    """Polars reductions are typed broadly; coerce for API stats."""
+    if v is None:
+        return default
+    return float(cast(Any, v))
+
+
+def _parse_ts_bound(v) -> datetime | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    s = str(v).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
+def _read_upload(file: UploadFile) -> tuple[pl.DataFrame, bytes]:
     content = file.file.read()
     name = file.filename or ""
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        df = pd.read_excel(io.BytesIO(content))
-    elif name.endswith(".parquet"):
-        df = pd.read_parquet(io.BytesIO(content))
-    else:
-        df = pd.read_csv(io.BytesIO(content))
-    return df, content
+    return read_upload_bytes(name, content), content
 
 
 def _dataset_meta(d: Dataset, data_source: DataSource | None = None) -> DatasetMeta:
@@ -145,26 +159,23 @@ async def upload_dataset(
     blob_path = f"{user.tenant_id}/{file.filename}"
     blob.upload_bytes("datasets", blob_path, content)
 
-    schema = {col: str(dtype) for col, dtype in df.dtypes.items()}
+    schema = schema_dtype_map(df)
 
-    # Auto-detect datetime column
+    # Auto-detect datetime column (name heuristic)
     datetime_col = None
     for col in df.columns:
-        if "date" in col.lower() or "time" in col.lower() or "ds" == col.lower():
-            try:
-                pd.to_datetime(df[col].head(10))
-                datetime_col = col
-                break
-            except Exception:
-                pass
+        cl = col.lower()
+        if "date" in cl or "time" in cl or cl == "ds":
+            datetime_col = col
+            break
 
     dataset = Dataset(
         tenant_id=user.tenant_id,
         name=file.filename or "untitled",
         blob_path=blob_path,
         schema_json=schema,
-        row_count=len(df),
-        column_count=len(df.columns),
+        row_count=df.height,
+        column_count=df.width,
         datetime_column=datetime_col,
     )
     db.add(dataset)
@@ -225,21 +236,28 @@ async def preview_dataset(
     try:
         df = blob.download_df("datasets", dataset.blob_path)
     except FileNotFoundError:
-        raise HTTPException(404, "Dataset file not found in storage")
+        raise HTTPException(404, "Dataset file not found in storage") from None
 
-    head = df.head(rows).where(pd.notnull(df.head(rows)), None).to_dict(orient="records")
+    head = df.head(rows).to_dicts()
 
-    # Basic stats for numeric columns
     stats: dict = {}
-    for col in df.select_dtypes(include="number").columns:
-        s = df[col].describe()
-        stats[col] = {k: round(float(v), 4) for k, v in s.items()}
+    for col in df.columns:
+        if df[col].dtype.is_numeric():
+            try:
+                stats[col] = {
+                    "mean": round(_pl_scalar_float(df[col].mean()), 4),
+                    "std": round(_pl_scalar_float(df[col].std()), 4),
+                    "min": round(_pl_scalar_float(df[col].min()), 4),
+                    "max": round(_pl_scalar_float(df[col].max()), 4),
+                }
+            except Exception:
+                pass
 
     return PreviewResponse(
         columns=list(df.columns),
-        dtypes={col: str(dt) for col, dt in df.dtypes.items()},
+        dtypes={c: str(df[c].dtype) for c in df.columns},
         head=head,
-        shape=[len(df), len(df.columns)],
+        shape=[df.height, df.width],
         stats=stats,
     )
 
@@ -290,9 +308,9 @@ async def transform_dataset(
     try:
         df = blob.download_df("datasets", dataset.blob_path)
     except FileNotFoundError:
-        raise HTTPException(404, "Dataset file not found in storage")
+        raise HTTPException(404, "Dataset file not found in storage") from None
 
-    rows_before = len(df)
+    rows_before = df.height
 
     try:
         op = body.operation
@@ -302,39 +320,56 @@ async def transform_dataset(
             col = p.get("column")
             method = p.get("method", "ffill")
             if col and col in df.columns:
-                df[col] = (
-                    df[col].fillna(method=method)
-                    if method in ("ffill", "bfill")
-                    else df[col].fillna(float(method))
-                )
+                if method == "ffill":
+                    df = df.with_columns(pl.col(col).forward_fill())
+                elif method == "bfill":
+                    df = df.with_columns(pl.col(col).backward_fill())
+                else:
+                    try:
+                        v = float(method)
+                        df = df.with_columns(pl.col(col).fill_null(v))
+                    except ValueError as err:
+                        raise HTTPException(
+                            400,
+                            "fill_missing with a column requires method ffill, bfill, or a number",
+                        ) from err
             else:
-                df = df.fillna(method=method)
+                if method == "ffill":
+                    df = df.fill_null(strategy="forward")
+                elif method == "bfill":
+                    df = df.fill_null(strategy="backward")
+                else:
+                    df = df.fill_null(0)
 
         elif op == "drop_missing":
             col = p.get("column")
-            df = df.dropna(subset=[col]) if col else df.dropna()
+            df = df.drop_nulls(subset=[col]) if col else df.drop_nulls()
 
         elif op == "clip_negative":
             col = p.get("column", dataset.target_column)
             if col and col in df.columns:
-                df[col] = df[col].clip(lower=0)
+                df = df.with_columns(pl.col(col).clip(lower_bound=0))
 
         elif op == "filter_date_range":
             col = p.get("column", dataset.datetime_column)
             start = p.get("start")
             end = p.get("end")
             if col and col in df.columns:
-                df[col] = pd.to_datetime(df[col])
-                if start:
-                    df = df[df[col] >= pd.Timestamp(start)]
-                if end:
-                    df = df[df[col] <= pd.Timestamp(end)]
+                tsc = pl.col(col).cast(pl.Datetime, strict=False)
+                cond = pl.lit(True)
+                if start is not None:
+                    st = _parse_ts_bound(start)
+                    cond = cond & (tsc >= pl.lit(st))
+                if end is not None:
+                    en = _parse_ts_bound(end)
+                    cond = cond & (tsc <= pl.lit(en))
+                df = df.filter(cond)
 
         elif op == "rename_column":
             old = p.get("old_name")
             new = p.get("new_name")
             if old and new and old in df.columns:
-                df = df.rename(columns={old: new})
+                df = df.rename({old: new})
                 if dataset.datetime_column == old:
                     dataset.datetime_column = new
                 if dataset.target_column == old:
@@ -343,7 +378,7 @@ async def transform_dataset(
         elif op == "drop_column":
             col = p.get("column")
             if col and col in df.columns:
-                df = df.drop(columns=[col])
+                df = df.drop(col)
 
         else:
             raise HTTPException(400, f"Unknown operation: {op}")
@@ -351,19 +386,22 @@ async def transform_dataset(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(422, f"Transform failed: {e}")
+        raise HTTPException(422, f"Transform failed: {e}") from e
 
     blob.upload_df("datasets", dataset.blob_path, df)
-    dataset.row_count = len(df)
-    dataset.column_count = len(df.columns)
-    dataset.schema_json = {col: str(dt) for col, dt in df.dtypes.items()}
+    dataset.row_count = df.height
+    dataset.column_count = df.width
+    prev_meta = {k: v for k, v in (dataset.schema_json or {}).items() if str(k).startswith("__")}
+    new_schema = schema_dtype_map(df)
+    new_schema.update(prev_meta)
+    dataset.schema_json = new_schema
     await db.flush()
 
     return TransformResponse(
         success=True,
         message=f"Operation '{body.operation}' applied",
         rows_before=rows_before,
-        rows_after=len(df),
+        rows_after=df.height,
     )
 
 

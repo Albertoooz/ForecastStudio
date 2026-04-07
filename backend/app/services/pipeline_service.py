@@ -4,7 +4,7 @@ Pipeline Service — thin wrapper delegating to ModelService.
 
 from uuid import UUID
 
-import pandas as pd
+import polars as pl
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +14,7 @@ from app.services.model_service import ModelService
 
 class PipelineService:
     @staticmethod
-    async def run(model_run_id: UUID, df: pd.DataFrame, db: AsyncSession) -> ModelRun:
+    async def run(model_run_id: UUID, df: pl.DataFrame, db: AsyncSession) -> ModelRun:
         return await ModelService.run_training(model_run_id, df, db)
 
     @staticmethod

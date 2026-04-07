@@ -7,7 +7,7 @@ before any heavy computation begins.
 
 from __future__ import annotations
 
-import pandas as pd
+import polars as pl
 
 from forecaster.agents.base import BaseAgent
 from forecaster.core.context import AgentDecision, ContextWindow
@@ -141,7 +141,7 @@ class MemoryManagerAgent(BaseAgent):
     # -- Estimation helpers ------------------------------------------------
 
     @staticmethod
-    def _estimate_data_memory(df: pd.DataFrame) -> int:
+    def _estimate_data_memory(df: pl.DataFrame) -> int:
         """Estimate memory used by the DataFrame in MB."""
         mem_bytes = df.memory_usage(deep=True).sum()
         return max(1, int(mem_bytes / (1024 * 1024)))
@@ -164,7 +164,7 @@ class MemoryManagerAgent(BaseAgent):
         return max(0.5, round(base, 1))
 
     @staticmethod
-    def _count_groups(df: pd.DataFrame, group_columns: list[str]) -> int:
+    def _count_groups(df: pl.DataFrame, group_columns: list[str]) -> int:
         """Count number of groups in data."""
         if not group_columns:
             return 1
