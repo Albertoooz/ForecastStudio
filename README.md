@@ -12,16 +12,18 @@ Deployable forecasting and analytics platform for teams: multi-agent orchestrati
 cp .env.example .env
 # Set LLM_API_KEY (or legacy DEEPSEEK_API_KEY) and optional LLM_BASE_URL / LLM_MODEL
 
-make local-up          # stack with Langfuse (observability profile)
-# or
-make local-platform    # app + MLflow + Dagster UI (no Langfuse)
+docker compose up -d   # core app + Postgres/Redis + MLflow + Dagster
+# optional Langfuse (observability):
+make local-up
 ```
 
 - Frontend: http://localhost:3000
 - Backend API: http://localhost:8000 (OpenAPI: `/docs`)
-- Langfuse (with `local-up`): http://localhost:3001
-- MLflow (`local-dataops` or `local-platform`): http://localhost:5000
-- Dagster (`local-platform`): http://localhost:3005
+- MLflow: http://localhost:5000 (if `:5000` is busy — e.g. macOS AirPlay — set `MLFLOW_HOST_PORT=5001` in `.env` and run `docker compose up -d --build`)
+- Dagster UI: http://localhost:3005
+- Langfuse (only with `make local-up` / `--profile observability`): http://localhost:3001
+
+`NEXT_PUBLIC_MLFLOW_URL` / `NEXT_PUBLIC_DAGSTER_URL` are set in Compose for the frontend image so you can embed or link them (e.g. Scheduling) without reinventing those UIs.
 
 ## Quick start (local dev, no Docker for app code)
 
@@ -132,10 +134,8 @@ uv run dagster dev -m fs_orch.definitions
 
 ### MLflow (Docker)
 
-```bash
-make local-dataops
-# Tracking URI: http://localhost:5000
-```
+Included in the default stack (`docker compose up -d`). Tracking URI: http://localhost:5000
+(`make local-dataops` only ensures the MLflow container is running.)
 
 ## Configuration
 

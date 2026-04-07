@@ -79,6 +79,40 @@ export const dataApi = {
   delete: (datasetId: string) => api.delete(`/data/${datasetId}`),
 };
 
+// ── Data connections (Postgres → snapshot in blob) ───────────────────────────
+
+export const connectionsApi = {
+  test: (postgres: Record<string, unknown>) =>
+    api.post("/data/connections/test", { source_type: "postgres", postgres }),
+  probeTables: (postgres: Record<string, unknown>) =>
+    api.post("/data/connections/probe/tables", { source_type: "postgres", postgres }),
+  probePreview: (
+    postgres: Record<string, unknown>,
+    table: string,
+    rows = 20,
+  ) =>
+    api.post("/data/connections/probe/preview", {
+      source_type: "postgres",
+      postgres,
+      table,
+      rows,
+    }),
+  create: (body: {
+    name: string;
+    source_type: string;
+    postgres: Record<string, unknown>;
+    dataset_type?: string | null;
+  }) => api.post("/data/connections/", body),
+  sync: (dataSourceId: string) =>
+    api.post(`/data/connections/${dataSourceId}/sync`),
+  tables: (dataSourceId: string) =>
+    api.get(`/data/connections/${dataSourceId}/tables`),
+  previewSaved: (dataSourceId: string, table: string, rows = 50) =>
+    api.get(`/data/connections/${dataSourceId}/preview`, {
+      params: { table, rows },
+    }),
+};
+
 // ── Models ───────────────────────────────────────────────────────────────────
 
 export const modelsApi = {

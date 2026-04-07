@@ -11,7 +11,7 @@ from fastapi.responses import RedirectResponse
 
 from app.config import get_settings, sync_langfuse_env_from_settings, sync_llm_env_from_settings
 from app.db.session import engine, Base
-from app.api import auth, data, models, agents, monitoring
+from app.api import auth, connections, data, models, agents, monitoring
 from forecaster.utils.observability import flush_langfuse
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,11 @@ def create_app() -> FastAPI:
     # Routers
     application.include_router(auth.router, prefix=f"{settings.api_prefix}/auth", tags=["auth"])
     application.include_router(data.router, prefix=f"{settings.api_prefix}/data", tags=["data"])
+    application.include_router(
+        connections.router,
+        prefix=f"{settings.api_prefix}/data/connections",
+        tags=["data-connections"],
+    )
     application.include_router(
         models.router, prefix=f"{settings.api_prefix}/models", tags=["models"]
     )

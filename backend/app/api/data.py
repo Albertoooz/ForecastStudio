@@ -3,6 +3,7 @@ Data API — Upload, preview, transform, list, delete datasets.
 """
 
 import io
+from datetime import datetime
 from uuid import UUID
 
 import pandas as pd
@@ -10,9 +11,10 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.auth import get_current_user
-from app.db.models import Dataset, User
+from app.db.models import DataSource, Dataset, User
 from app.db.session import get_db
 from app.storage.blob import get_blob_storage
 
@@ -35,6 +37,13 @@ class DatasetMeta(BaseModel):
     dataset_type: str = "training"  # "training" | "future_variables"
     linked_dataset_id: str | None = None
     created_at: str
+    # Optional — set when dataset is backed by a DataSource (Postgres, etc.)
+    data_source_id: UUID | None = None
+    source_type: str | None = None
+    sync_status: str | None = None
+    last_sync_at: str | None = None
+    last_error: str | None = None
+    query_or_table: str | None = None
 
 
 class DatasetListResponse(BaseModel):
@@ -86,7 +95,7 @@ def _read_upload(file: UploadFile) -> tuple[pd.DataFrame, bytes]:
     return df, content
 
 
-def _dataset_meta(d: Dataset) -> DatasetMeta:
+def _dataset_meta(d: Dataset, data_source: DataSource | None = None) -> DatasetMeta:
     schema = d.schema_json or {}
     schema_cols = [k for k in schema.keys() if not k.startswith("__")] if schema else None
     group_cols = (
@@ -94,6 +103,10 @@ def _dataset_meta(d: Dataset) -> DatasetMeta:
         if isinstance(d.group_columns, list)
         else ([d.group_columns] if isinstance(d.group_columns, str) and d.group_columns else None)
     )
+    ds = data_source
+    if ds is None and getattr(d, "data_sources", None):
+        srcs = d.data_sources
+        ds = srcs[0] if srcs else None
     return DatasetMeta(
         id=d.id,
         name=d.name,
@@ -107,6 +120,12 @@ def _dataset_meta(d: Dataset) -> DatasetMeta:
         dataset_type=schema.get("__type__", "training"),
         linked_dataset_id=schema.get("__linked_dataset_id__"),
         created_at=str(d.created_at),
+        data_source_id=ds.id if ds else None,
+        source_type=ds.source_type if ds else None,
+        sync_status=ds.status if ds else None,
+        last_sync_at=str(ds.last_sync_at) if ds and ds.last_sync_at else None,
+        last_error=ds.last_error if ds else None,
+        query_or_table=ds.query_or_table if ds else None,
     )
 
 
@@ -151,7 +170,18 @@ async def upload_dataset(
     db.add(dataset)
     await db.flush()
 
-    return _dataset_meta(dataset)
+    file_ds = DataSource(
+        dataset_id=dataset.id,
+        source_type="file",
+        config_json={"original_filename": file.filename},
+        query_or_table=file.filename,
+        status="connected",
+        last_sync_at=datetime.utcnow(),
+    )
+    db.add(file_ds)
+    await db.flush()
+
+    return _dataset_meta(dataset, file_ds)
 
 
 @router.get("/list", response_model=DatasetListResponse)
@@ -164,6 +194,7 @@ async def list_datasets(
     q = (
         select(Dataset)
         .where(Dataset.tenant_id == user.tenant_id)
+        .options(selectinload(Dataset.data_sources))
         .order_by(Dataset.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -359,7 +390,9 @@ async def delete_dataset(
 
 async def _get_dataset(dataset_id: UUID, tenant_id: UUID, db: AsyncSession) -> Dataset:
     result = await db.execute(
-        select(Dataset).where(Dataset.id == dataset_id, Dataset.tenant_id == tenant_id)
+        select(Dataset)
+        .options(selectinload(Dataset.data_sources))
+        .where(Dataset.id == dataset_id, Dataset.tenant_id == tenant_id)
     )
     dataset = result.scalar_one_or_none()
     if not dataset:

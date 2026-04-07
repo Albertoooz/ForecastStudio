@@ -34,7 +34,7 @@ cd frontend && npm install && npm run dev
 
 App: http://localhost:3000 · API docs: http://localhost:8000/docs
 
-Or use Docker: `make local-up` or `make local-platform` (see `README.md`).
+Or use Docker: `docker compose up -d` or `make local-up` (with Langfuse — see `README.md`).
 
 ## Backend only (FastAPI)
 

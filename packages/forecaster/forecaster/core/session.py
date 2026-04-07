@@ -34,6 +34,13 @@ class DataInfo(BaseModel):
     filepath: Path
     filename: str
     columns: list[ColumnInfo] = Field(default_factory=list)
+    # Active dataset id (UUID string) when loaded from API — for agent awareness
+    dataset_id: str | None = None
+    # DataSource metadata (Postgres, file upload, etc.)
+    source_type: str | None = None
+    sync_status: str | None = None
+    last_sync_at: str | None = None
+    query_or_table: str | None = None
     datetime_column: str | None = None
     target_column: str | None = None
     group_by_column: str | None = None  # For multivariate forecasting (legacy, single column)
@@ -101,6 +108,10 @@ class ForecastSession(BaseModel):
     uploaded_file: Path | None = None
     data_info: DataInfo | None = None
     current_df: Any | None = None
+    # UUID string of the dataset row currently loaded into current_df (chat API)
+    active_dataset_id: str | None = None
+    # Catalog of all tenant datasets (id, name, source_type, …) for list_datasets / context
+    available_datasets: list[dict[str, Any]] | None = None
 
     # Model state
     forecast_config: ModelConfig | None = None

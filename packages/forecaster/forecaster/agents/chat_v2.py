@@ -73,6 +73,7 @@ class ChatAgentV2:
             "show_missing_summary",
             "get_model_info",
             "show_pipeline_status",
+            "list_datasets",
         }
     )
 
@@ -290,6 +291,8 @@ class ChatAgentV2:
     ) -> str:
         """Run an inspect tool and return a concise text result for the LLM."""
         # Model / pipeline tools don't need a DataFrame
+        if tool_name == "list_datasets":
+            return self._inspect_list_datasets(session)
         if tool_name == "get_model_info":
             return self._inspect_model_info(session)
         if tool_name == "show_pipeline_status":
@@ -378,6 +381,35 @@ class ChatAgentV2:
             return f"Error executing {tool_name}: {exc}"
 
         return f"Unknown inspect tool: {tool_name}"
+
+    def _inspect_list_datasets(self, session: ForecastSession) -> str:
+        """Format tenant dataset catalog for the LLM (from API-injected available_datasets)."""
+        cats = session.available_datasets or []
+        if not cats:
+            return "No dataset catalog loaded (empty workspace or API did not attach available_datasets)."
+        lines: list[str] = [f"Total datasets: {len(cats)}\n"]
+        for d in cats:
+            did = d.get("id", "?")
+            name = d.get("name", "?")
+            rows = d.get("rows")
+            cols = d.get("columns")
+            st = d.get("source_type") or "unknown"
+            sync = d.get("sync_status") or ""
+            dstype = d.get("dataset_type") or "training"
+            dt = d.get("datetime_column") or "—"
+            tgt = d.get("target_column") or "—"
+            qot = d.get("query_or_table")
+            qline = (
+                f"\n    query/table: {qot[:120]}…"
+                if qot and len(str(qot)) > 120
+                else (f"\n    query/table: {qot}" if qot else "")
+            )
+            lines.append(
+                f"• id={did}\n  name={name!r}\n  type={dstype}  source={st}"
+                + (f"  sync={sync}" if sync else "")
+                + f"\n  rows={rows}  cols={cols}\n  datetime={dt}  target={tgt}{qline}"
+            )
+        return "\n".join(lines)
 
     def _inspect_model_info(self, session: ForecastSession) -> str:
         """Return model information for the LLM."""
@@ -495,8 +527,48 @@ class ChatAgentV2:
                 parts.append("\n⚠️  DATA ISSUES:")
                 for issue in di.issues[:5]:
                     parts.append(f"   - {issue}")
+
+            # External source metadata (PostgreSQL snapshot, file upload, …)
+            if di.dataset_id or di.source_type:
+                parts.append("\n" + "=" * 60)
+                parts.append("📌 DATA SOURCE INFO (active dataset)")
+                parts.append("=" * 60)
+                if di.dataset_id:
+                    parts.append(f"Dataset id: {di.dataset_id}")
+                if di.source_type:
+                    parts.append(
+                        f"Source: {di.source_type} "
+                        f"(postgres/sql = database snapshot; file = CSV/Excel/Parquet upload)"
+                    )
+                if di.sync_status:
+                    parts.append(f"Sync status: {di.sync_status}")
+                if di.last_sync_at:
+                    parts.append(f"Last sync: {di.last_sync_at}")
+                if di.query_or_table:
+                    q = str(di.query_or_table)
+                    parts.append(f"Query / table: {q[:300]}{'…' if len(q) > 300 else ''}")
         else:
             parts.append("❌ NO DATA LOADED")
+
+        # All datasets in workspace (injected by chat API)
+        ads = session.available_datasets
+        if ads:
+            parts.append("\n" + "=" * 60)
+            parts.append("📚 AVAILABLE DATASETS (switch with switch_dataset)")
+            parts.append("=" * 60)
+            for d in ads[:30]:
+                marker = (
+                    " ← ACTIVE"
+                    if session.active_dataset_id
+                    and str(d.get("id")) == str(session.active_dataset_id)
+                    else ""
+                )
+                parts.append(
+                    f"  • {d.get('name')}  id={d.get('id')}  "
+                    f"src={d.get('source_type') or '?'}  rows={d.get('rows')}{marker}"
+                )
+            if len(ads) > 30:
+                parts.append(f"  … and {len(ads) - 30} more (use list_datasets for full detail)")
 
         # Model config
         if session.forecast_config:
@@ -594,6 +666,7 @@ TOOLS:
   MODEL: set_model(model_type, hyperparameters), get_model_info
   PIPELINE: run_forecast, rerun_pipeline_step, show_pipeline_status
   INSPECT: describe_data, show_dtypes, show_head, value_counts, show_correlation
+  DATASETS: list_datasets, switch_dataset, resync_dataset
 
 INSPECT vs ACTION tools:
 - Inspect tools (show_head, describe_data, show_dtypes, value_counts, show_correlation, show_missing_summary, get_model_info, show_pipeline_status) → you will see their output and can use it in your answer.
@@ -607,6 +680,8 @@ RULES:
 5. Grouping: if group_by_columns set, create_column must use df.groupby(...)['col'].transform(...).
 6. Be concise. No walls of text. State what you did and the result.
 7. Feature/model overrides take effect on the NEXT run_forecast. Pass [] to clear.
+8. Context lists ALL available datasets (PostgreSQL snapshots and file uploads). If the user asks what data exists, use list_datasets for details or read CONTEXT. To analyze another dataset, call switch_dataset(dataset_id) with the UUID from the list; then use inspect tools on the new snapshot.
+9. resync_dataset refreshes PostgreSQL-backed snapshots from the database; it does not apply to file uploads.
 """
 
 

@@ -136,6 +136,7 @@ def _register_all_tools(r: ToolRegistry):
     _register_model_tools(r)
     _register_pipeline_tools(r)
     _register_inspect_tools(r)
+    _register_dataset_tools(r)
     logger.info(f"Registered {len(r.list_tools())} tools")
 
 
@@ -730,6 +731,68 @@ def _register_inspect_tools(r: ToolRegistry):
                     "description": "Columns to correlate (default: all numeric)",
                 },
                 "top_n": {"type": "integer", "default": 10},
+            },
+        },
+    )
+
+
+# ------------------------------------------------------------------
+# 8. DATASETS / DATA SOURCES (catalog, switch, re-sync)
+# ------------------------------------------------------------------
+def _register_dataset_tools(r: ToolRegistry):
+    r.register_tool(
+        name="list_datasets",
+        category="datasets",
+        function=lambda: {"action": "list_datasets"},
+        description=(
+            "List all datasets available in the workspace (names, ids, source: PostgreSQL vs file, "
+            "sync status, row counts). Use when the user asks what data exists or which sources are connected."
+        ),
+        parameters={"type": "object", "properties": {}},
+    )
+
+    r.register_tool(
+        name="switch_dataset",
+        category="datasets",
+        function=lambda dataset_id: {
+            "action": "switch_dataset",
+            "dataset_id": str(dataset_id),
+        },
+        description=(
+            "Switch the active dataset for this chat to the given dataset UUID. "
+            "Inspect tools and data operations will then apply to that snapshot. "
+            "Use list_datasets first if you need the id."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "dataset_id": {
+                    "type": "string",
+                    "description": "UUID of the dataset row (from list_datasets or CONTEXT)",
+                },
+            },
+            "required": ["dataset_id"],
+        },
+    )
+
+    r.register_tool(
+        name="resync_dataset",
+        category="datasets",
+        function=lambda dataset_id=None: {
+            "action": "resync_dataset",
+            **({"dataset_id": str(dataset_id)} if dataset_id else {}),
+        },
+        description=(
+            "Re-fetch data from the external PostgreSQL source into the stored snapshot (blob). "
+            "Only works for datasets connected via Postgres. Omit dataset_id to refresh the active dataset."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "dataset_id": {
+                    "type": "string",
+                    "description": "Optional UUID; defaults to the currently active dataset",
+                },
             },
         },
     )

@@ -30,6 +30,46 @@ export interface Dataset {
   dataset_type: "training" | "future_variables";
   linked_dataset_id: string | null;
   created_at: string;
+  /** Present when backed by a DataSource (Postgres, file, …) */
+  data_source_id?: string | null;
+  source_type?: string | null;
+  sync_status?: string | null;
+  last_sync_at?: string | null;
+  last_error?: string | null;
+  query_or_table?: string | null;
+}
+
+/** Payload for Postgres connection wizard / API */
+export interface PostgresConnectionPayload {
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  password: string;
+  query?: string | null;
+  table?: string | null;
+}
+
+export type ConnectionSourceType = "postgres" | "csv";
+
+export interface ConnectionConfig {
+  source_type: ConnectionSourceType;
+  host?: string;
+  port?: number;
+  database?: string;
+  username?: string;
+  password?: string;
+  query?: string;
+  table?: string;
+}
+
+export interface DataSourceMeta {
+  id: string;
+  dataset_id: string;
+  source_type: string;
+  status: "connected" | "error" | "syncing";
+  last_sync_at: string | null;
+  last_error: string | null;
 }
 
 // ── Model ────────────────────────────────────────────────────────────────────

@@ -110,8 +110,15 @@ class DataSource(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     dataset_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("datasets.id"), nullable=False)
-    source_type: Mapped[str] = mapped_column(String(20), nullable=False)  # file / sql / api
+    source_type: Mapped[str] = mapped_column(
+        String(20), nullable=False
+    )  # file / postgres / sql / api
     config_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    query_or_table: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), default="connected"
+    )  # connected / error / syncing
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     schedule_cron: Mapped[str | None] = mapped_column(String(100), nullable=True)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())

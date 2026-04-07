@@ -251,6 +251,12 @@ export default function ChatPage() {
       setMessages(updated);
       persistMessages(updated);
 
+      const nextDs = (data as { active_dataset_id?: string }).active_dataset_id;
+      if (nextDs && nextDs !== selectedDataset) {
+        setSelectedDataset(nextDs);
+        localStorage.setItem(LAST_DATASET_KEY, nextDs);
+      }
+
       if (data.executed_operations?.length) {
         window.dispatchEvent(
           new CustomEvent("datasets-updated", {

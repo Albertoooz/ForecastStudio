@@ -38,8 +38,8 @@ wheels/
 .env
 .env.local
 
-# Data
-data/
+# Data (repo root only — do not use bare `data/` or Next.js app/data and components/data are ignored)
+/data/
 *.parquet
 *.pkl
 

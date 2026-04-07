@@ -21,12 +21,14 @@ help: ## Show available targets
 # LOCAL DEVELOPMENT
 # ═══════════════════════════════════════════════════════════════════════════
 
-local-up: ## Run full stack (incl. Langfuse observability profile)
+local-up: ## Full stack: app + Postgres/Redis + MLflow + Dagster + Langfuse
 	$(COMPOSE) --profile observability up -d
 	@echo ""
 	@echo "  Frontend:  http://localhost:3000"
 	@echo "  Backend:   http://localhost:8000"
 	@echo "  API docs:  http://localhost:8000/docs"
+	@echo "  MLflow:    http://localhost:5000"
+	@echo "  Dagster:   http://localhost:3005"
 	@echo "  Langfuse:  http://localhost:3001"
 	@echo ""
 
@@ -44,12 +46,12 @@ local-tools: ## PgAdmin + Redis Commander
 	@echo "  PgAdmin:    http://localhost:5050"
 	@echo "  Redis CLI:  http://localhost:8081"
 
-local-dataops: ## MLflow (profile dataops) — http://localhost:5000
-	$(COMPOSE) --profile dataops up -d mlflow
+local-dataops: ## Ensure MLflow is up (included in default stack; idempotent)
+	$(COMPOSE) up -d mlflow
 	@echo "  MLflow: http://localhost:5000"
 
-local-platform: ## Next + backend + MLflow + Dagster (profile platform)
-	$(COMPOSE) --profile platform up -d
+local-platform: ## All default services (same as: docker compose up -d)
+	$(COMPOSE) up -d
 	@echo ""
 	@echo "  Frontend:   http://localhost:3000"
 	@echo "  Backend:    http://localhost:8000"

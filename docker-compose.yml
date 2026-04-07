@@ -1,18 +1,18 @@
 # ── Forecast Studio — Full Local Stack ───────────────────────────────────
 #
 # Uruchamianie:
-#   docker compose up -d                  # core: postgres, redis, backend, celery, frontend
+#   docker compose up -d                  # core + MLflow + Dagster
+#   docker compose up -d --build frontend # also starts MLflow + Dagster (Scheduling iframe)
 #   docker compose up -d postgres redis   # tylko infra (do dev bez dockera)
 #   docker compose --profile tools up -d  # z pgadmin i redis-commander
 #   docker compose --profile observability up -d   # + Langfuse (make local-up)
-#   docker compose --profile platform up -d        # + MLflow + Dagster (make local-platform)
 #
 # Dostęp:
 #   Frontend:  http://localhost:3000
 #   Backend:   http://localhost:8000  (docs: /docs)
+#   MLflow:    http://localhost:${MLFLOW_HOST_PORT:-5000}  (set MLFLOW_HOST_PORT if :5000 busy)
+#   Dagster:   http://localhost:3005
 #   PgAdmin:   http://localhost:5050  (profile: tools)
-#   MLflow:    http://localhost:5000  (profile: dataops lub platform)
-#   Dagster:   http://localhost:3005  (profile: platform)
 #
 
 x-backend-env: &backend-env
@@ -103,11 +103,12 @@ services:
       retries: 5
 
   # ── Redis ──────────────────────────────────────────────────────────────
+  # Host port: default 6379. If "address already in use", set REDIS_HOST_PORT=6380 in .env
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -122,6 +123,8 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     environment:
@@ -147,6 +150,8 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       <<: *backend-env
     depends_on:
@@ -185,13 +190,24 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_MLFLOW_URL: http://localhost:${MLFLOW_HOST_PORT:-5000}
+        NEXT_PUBLIC_DAGSTER_URL: http://localhost:3005
     restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_MLFLOW_URL: http://localhost:${MLFLOW_HOST_PORT:-5000}
+      NEXT_PUBLIC_DAGSTER_URL: http://localhost:3005
     depends_on:
-      - backend
+      backend:
+        condition: service_started
+      mlflow:
+        condition: service_started
+      dagster-webserver:
+        condition: service_started
 
   # ── Langfuse (local observability stack) ───────────────────────────────
   langfuse-postgres:
@@ -341,13 +357,12 @@ services:
     depends_on:
       - redis
 
-  # ── MLflow (profiles: dataops | platform) ────────────────────────────────
+  # ── MLflow (default stack — scheduling / experiments) ───────────────────
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.19.0
     restart: unless-stopped
-    profiles: ["dataops", "platform"]
     ports:
-      - "5000:5000"
+      - "${MLFLOW_HOST_PORT:-5000}:5000"
     command: >
       mlflow server
       --host 0.0.0.0
@@ -357,13 +372,12 @@ services:
     volumes:
       - mlflow_data:/mlflow
 
-  # ── Dagster (profile platform — http://localhost:3005) ───────────────────
+  # ── Dagster UI (default stack — embed / link from Scheduling) ───────────
   dagster-webserver:
     build:
       context: .
       dockerfile: orchestration/Dockerfile
     restart: unless-stopped
-    profiles: ["platform"]
     ports:
       - "3005:3000"
     volumes:

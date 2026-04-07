@@ -1,97 +1,64 @@
 "use client";
 
-import { useState } from "react";
+import { ExternalLink } from "lucide-react";
+
 import { AppShell } from "@/components/layout/AppShell";
-import { Clock, Play, Pause, Trash2, Plus } from "lucide-react";
-import type { Schedule } from "@/types";
 
+const DAGSTER_URL =
+  process.env.NEXT_PUBLIC_DAGSTER_URL || "http://localhost:3005";
+
+/**
+ * Scheduling = embedded Dagster UI. All schedules, sensors, and ops are
+ * managed in Dagster; this page is a thin shell so users stay inside Forecast Studio.
+ */
 export default function SchedulingPage() {
-  const [schedules, setSchedules] = useState<Schedule[]>([]);
-
   return (
     <AppShell>
-      <div className="space-y-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold">Scheduling</h1>
-            <p className="text-sm text-gray-500">
-              Automate retraining, forecasting and monitoring on a schedule
-            </p>
+      <div className="-mx-6 -mt-2 flex min-h-[calc(100vh-5rem)] flex-col">
+        <div className="mb-4 px-6">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h1 className="text-2xl font-bold">Scheduling</h1>
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                Pipelines and schedules live in{" "}
+                <span className="font-medium text-gray-700 dark:text-gray-300">
+                  Dagster
+                </span>
+                — edit runs, sensors, and jobs here without leaving the app.
+              </p>
+            </div>
+            <a
+              href={DAGSTER_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-700 shadow-sm transition-colors hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800"
+            >
+              <ExternalLink className="h-4 w-4" />
+              Open Dagster in new tab
+            </a>
           </div>
-          <button className="flex items-center gap-2 rounded-xl bg-brand-600 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-brand-700">
-            <Plus className="h-4 w-4" />
-            New schedule
-          </button>
         </div>
 
-        {/* Schedule list */}
-        <div className="rounded-xl border bg-white shadow-sm dark:bg-gray-900 dark:border-gray-800">
-          <div className="border-b px-6 py-4 dark:border-gray-800">
-            <h2 className="font-semibold">Active schedules</h2>
+        <div className="min-h-0 flex-1 px-6 pb-6">
+          <div className="h-[min(78vh,calc(100vh-11rem))] overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm dark:border-gray-800 dark:bg-gray-900">
+            <iframe
+              title="Dagster"
+              src={DAGSTER_URL}
+              className="h-full w-full border-0"
+              referrerPolicy="no-referrer-when-downgrade"
+            />
           </div>
-
-          {schedules.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-16 text-gray-400">
-              <Clock className="mb-4 h-12 w-12" />
-              <p className="text-sm">No schedules yet — click &quot;New schedule&quot;</p>
-            </div>
-          ) : (
-            <div className="divide-y dark:divide-gray-800">
-              {schedules.map((s) => (
-                <div
-                  key={s.id}
-                  className="flex items-center justify-between px-6 py-4"
-                >
-                  <div>
-                    <p className="font-medium">{s.schedule_type}</p>
-                    <p className="text-xs text-gray-500">
-                      Cron: {s.cron_expression}
-                      {s.next_run_at && ` • Next: ${s.next_run_at}`}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                        s.is_active
-                          ? "bg-green-50 text-green-700"
-                          : "bg-gray-100 text-gray-500"
-                      }`}
-                    >
-                      {s.is_active ? "Active" : "Paused"}
-                    </span>
-                    <button className="rounded p-1 hover:bg-gray-100 dark:hover:bg-gray-800">
-                      {s.is_active ? (
-                        <Pause className="h-4 w-4 text-gray-500" />
-                      ) : (
-                        <Play className="h-4 w-4 text-gray-500" />
-                      )}
-                    </button>
-                    <button className="rounded p-1 hover:bg-gray-100 dark:hover:bg-gray-800">
-                      <Trash2 className="h-4 w-4 text-red-500" />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Help */}
-        <div className="rounded-xl border border-brand-200 bg-brand-50 p-6 dark:bg-brand-900/10 dark:border-brand-800">
-          <h3 className="font-semibold text-brand-900 dark:text-brand-300">
-            Schedule types
-          </h3>
-          <ul className="mt-2 space-y-1 text-sm text-brand-700 dark:text-brand-400">
-            <li>
-              <strong>Retrain</strong> — automatic model retraining on new data
-            </li>
-            <li>
-              <strong>Forecast</strong> — periodic forecast generation
-            </li>
-            <li>
-              <strong>Monitor</strong> — drift and data quality checks
-            </li>
-          </ul>
+          <p className="mt-3 text-xs text-gray-500 dark:text-gray-400">
+            If the frame is empty, Dagster may block embedding (
+            <code className="rounded bg-gray-100 px-1 dark:bg-gray-800">
+              X-Frame-Options
+            </code>
+            ). Use &quot;Open Dagster in new tab&quot; or set{" "}
+            <code className="rounded bg-gray-100 px-1 dark:bg-gray-800">
+              NEXT_PUBLIC_DAGSTER_URL
+            </code>{" "}
+            to match your Dagster host.
+          </p>
         </div>
       </div>
     </AppShell>

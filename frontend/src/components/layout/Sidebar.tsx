@@ -17,7 +17,7 @@ import {
 const navItems = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/chat", label: "Chat", icon: MessageSquare },
-  { href: "/data", label: "Training Data", icon: Database },
+  { href: "/data", label: "Data Sources", icon: Database },
   { href: "/analysis", label: "Model Analysis", icon: BarChart3 },
   { href: "/pipeline", label: "Pipeline", icon: GitBranch },
   { href: "/monitoring", label: "Monitoring", icon: Activity },

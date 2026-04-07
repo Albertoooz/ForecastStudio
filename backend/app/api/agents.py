@@ -4,15 +4,19 @@ Agents API — Chat (multi-turn LLM + tools), pipeline control.
 Provides both REST and WebSocket endpoints for chat interaction.
 """
 
+from __future__ import annotations
+
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.auth import get_current_user
-from app.db.models import ChatSession, User
+from app.db.models import ChatSession, Dataset as DatasetModel, User
 from app.db.session import get_db
 
 router = APIRouter()
@@ -40,6 +44,7 @@ class ChatResponse(BaseModel):
     actions: list[dict] = []  # proposed actions for the UI to execute/confirm
     tool_calls_made: list[dict] = []
     executed_operations: list[str] = []
+    active_dataset_id: UUID | None = None  # after switch_dataset, aligns UI dropdown
 
 
 class ChatSessionResponse(BaseModel):
@@ -48,6 +53,83 @@ class ChatSessionResponse(BaseModel):
     message_count: int
     last_message: str | None
     created_at: str
+
+
+# ── ForecastSession + dataset loading (chat agent) ───────────────────────────
+
+
+def _group_columns_for_data_info(ds: DatasetModel) -> list[str]:
+    g = ds.group_columns
+    if isinstance(g, list):
+        return g
+    if isinstance(g, str) and g:
+        return [g]
+    return []
+
+
+async def _load_tenant_dataset_catalog(db: AsyncSession, tenant_id: UUID) -> list[dict]:
+    """All datasets for tenant as JSON-serializable dicts (for agent context + list_datasets)."""
+    from app.api.data import _dataset_meta
+
+    result = await db.execute(
+        select(DatasetModel)
+        .where(DatasetModel.tenant_id == tenant_id)
+        .options(selectinload(DatasetModel.data_sources))
+        .order_by(DatasetModel.created_at.desc())
+    )
+    rows = result.scalars().all()
+    return [_dataset_meta(d).model_dump(mode="json") for d in rows]
+
+
+async def _load_active_dataset_into_session(
+    db: AsyncSession,
+    tenant_id: UUID,
+    dataset_id: UUID,
+    chat_session: Any,
+) -> bool:
+    """Load blob + DataInfo into chat_session. Returns False if not found."""
+    import sys
+    from pathlib import Path as _Path
+
+    from forecaster.core.session import ColumnInfo, DataInfo
+
+    from app.storage.blob import get_blob_storage
+
+    result = await db.execute(
+        select(DatasetModel)
+        .where(DatasetModel.id == dataset_id, DatasetModel.tenant_id == tenant_id)
+        .options(selectinload(DatasetModel.data_sources))
+    )
+    ds = result.scalar_one_or_none()
+    if not ds or not ds.blob_path:
+        return False
+    try:
+        blob = get_blob_storage()
+        df = blob.download_df("datasets", ds.blob_path)
+        col_infos = [ColumnInfo(name=col, dtype=str(dt)) for col, dt in df.dtypes.items()]
+        srcs = ds.data_sources or []
+        src = srcs[0] if srcs else None
+        chat_session.data_info = DataInfo(
+            filepath=_Path(ds.blob_path or ds.name),
+            filename=ds.name,
+            columns=col_infos,
+            dataset_id=str(ds.id),
+            source_type=src.source_type if src else None,
+            sync_status=src.status if src else None,
+            last_sync_at=str(src.last_sync_at) if src and src.last_sync_at else None,
+            query_or_table=src.query_or_table if src else None,
+            datetime_column=ds.datetime_column,
+            target_column=ds.target_column,
+            group_by_columns=_group_columns_for_data_info(ds),
+            frequency=ds.frequency,
+            n_rows=ds.row_count or len(df),
+        )
+        chat_session.current_df = df
+        chat_session.active_dataset_id = str(ds.id)
+        return True
+    except Exception as load_err:
+        print(f"[agents/chat] Could not load dataset: {load_err}", file=sys.stderr)
+        return False
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -90,47 +172,18 @@ async def chat_message(
     # Build a ForecastSession for the chat agent
     try:
         import sys
-        from forecaster.core.session import ForecastSession
+
         from forecaster.agents.chat_v2 import get_chat_agent_v2
+        from forecaster.core.session import ForecastSession
 
         chat_session = ForecastSession(session_id=str(session.id))
+        chat_session.available_datasets = await _load_tenant_dataset_catalog(db, user.tenant_id)
 
-        # Inject dataset context if available
-        dataset_id_to_use = session.dataset_id or body.dataset_id
+        dataset_id_to_use: UUID | None = session.dataset_id or body.dataset_id
         if dataset_id_to_use:
-            from sqlalchemy import select as sa_select
-            from app.db.models import Dataset as DatasetModel
-
-            ds_result = await db.execute(
-                sa_select(DatasetModel).where(DatasetModel.id == dataset_id_to_use)
+            await _load_active_dataset_into_session(
+                db, user.tenant_id, dataset_id_to_use, chat_session
             )
-            ds = ds_result.scalar_one_or_none()
-            if ds:
-                try:
-                    from app.storage.blob import get_blob_storage
-                    from forecaster.core.session import DataInfo, ColumnInfo
-                    from pathlib import Path as _Path
-
-                    blob = get_blob_storage()
-                    df = blob.download_df("datasets", ds.blob_path)
-
-                    col_infos = [
-                        ColumnInfo(name=col, dtype=str(dt)) for col, dt in df.dtypes.items()
-                    ]
-                    data_info = DataInfo(
-                        filepath=_Path(ds.blob_path or ds.name),
-                        filename=ds.name,
-                        columns=col_infos,
-                        datetime_column=ds.datetime_column,
-                        target_column=ds.target_column,
-                        frequency=ds.frequency,
-                        n_rows=ds.row_count or len(df),
-                    )
-                    chat_session.data_info = data_info
-                    # Store df in session so the agent can read it
-                    chat_session.current_df = df
-                except Exception as load_err:
-                    print(f"[agents/chat] Could not load dataset: {load_err}", file=sys.stderr)
 
         # Restore prior message history (exclude the user message we just appended)
         for m in messages[:-1]:
@@ -143,11 +196,71 @@ async def chat_message(
 
         reply = result.get("response", "")
         actions = result.get("actions", [])
-        tool_calls_made = result.get("tool_calls", [])
+        tool_calls_made = list(result.get("tool_calls", []))
+
+        # ── Handle switch_dataset: persist session + reload df, re-run agent ─
+        _max_switch = 5
+        for _ in range(_max_switch):
+            switch_acts = [a for a in actions if a.get("action") == "switch_dataset"]
+            if not switch_acts:
+                break
+            raw_id = switch_acts[0].get("dataset_id")
+            if not raw_id:
+                break
+            try:
+                new_id = UUID(str(raw_id))
+            except ValueError:
+                break
+            chk = await db.execute(
+                select(DatasetModel).where(
+                    DatasetModel.id == new_id,
+                    DatasetModel.tenant_id == user.tenant_id,
+                )
+            )
+            if not chk.scalar_one_or_none():
+                reply += "\n\n(Could not switch: dataset not found or access denied.)"
+                actions = [a for a in actions if a.get("action") != "switch_dataset"]
+                break
+            session.dataset_id = new_id
+            await db.flush()
+            dataset_id_to_use = new_id
+            chat_session.available_datasets = await _load_tenant_dataset_catalog(db, user.tenant_id)
+            await _load_active_dataset_into_session(db, user.tenant_id, new_id, chat_session)
+            executed_ops.append("switch_dataset")
+            result = agent.process(chat_session, body.message)
+            reply = result.get("response", reply)
+            actions = result.get("actions", [])
+            tool_calls_made.extend(result.get("tool_calls", []))
+
+        # ── Handle resync_dataset (PostgreSQL snapshot refresh) ─────────────
+        from app.api.connections import sync_dataset_snapshot_for_chat
+
+        for act in [a for a in actions if a.get("action") == "resync_dataset"]:
+            rid = act.get("dataset_id") or dataset_id_to_use
+            if not rid:
+                continue
+            try:
+                sync_id = UUID(str(rid))
+            except ValueError:
+                continue
+            meta = await sync_dataset_snapshot_for_chat(
+                db,
+                tenant_id=user.tenant_id,
+                dataset_id=sync_id,
+            )
+            if meta is None:
+                reply += (
+                    "\n\n(Re-sync skipped: dataset has no PostgreSQL connection or was not found.)"
+                )
+            else:
+                await _load_active_dataset_into_session(db, user.tenant_id, sync_id, chat_session)
+                executed_ops.append("resync_dataset")
 
         # ── Execute data operations returned by the agent ──────────────────
         if actions and dataset_id_to_use:
             for act in actions:
+                if act.get("action") in ("switch_dataset", "resync_dataset"):
+                    continue
                 op_cfg = None
                 if act.get("action") == "data_operation":
                     op_cfg = act.get("config", {})
@@ -171,8 +284,11 @@ async def chat_message(
                         except Exception as op_err:
                             print(f"[agents/chat] Op {op_name} failed: {op_err}", file=sys.stderr)
 
-            if executed_ops:
-                reply += f"\n\n✅ Applied to dataset: {', '.join(executed_ops)}."
+            data_op_labels = [
+                x for x in executed_ops if x not in ("switch_dataset", "resync_dataset")
+            ]
+            if data_op_labels:
+                reply += f"\n\n✅ Applied to dataset: {', '.join(data_op_labels)}."
 
     except Exception as e:
         import sys
@@ -201,6 +317,7 @@ async def chat_message(
         actions=actions,
         tool_calls_made=tool_calls_made,
         executed_operations=executed_ops,
+        active_dataset_id=session.dataset_id,
     )
 
 
