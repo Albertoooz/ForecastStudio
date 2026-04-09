@@ -32,5 +32,9 @@ celery_app.conf.update(
     },
 )
 
-# Auto-discover tasks
+# Auto-discover tasks (Django-style). Without Django, the parent package alone is
+# imported — submodules like app.tasks.training are NOT, so tasks never register.
 celery_app.autodiscover_tasks(["app.tasks"])
+
+# Explicitly load modules that define @celery_app.task handlers.
+import app.tasks.training  # noqa: F401, E402 — side effect: task registration
