@@ -36,6 +36,25 @@ App: http://localhost:3000 · API docs: http://localhost:8000/docs
 
 Or use Docker: `docker compose up -d` or `make local-up` (with Langfuse — see `README.md`).
 
+### Training stuck in “queued” on the Pipeline page
+
+Training is executed by **Celery**, not the FastAPI process. If you start only `backend`, `postgres`, and `redis`, runs stay **`queued`** until a worker picks them up.
+
+- **Docker:** ensure the `celery-worker` service is running:
+
+  ```bash
+  docker compose ps celery-worker
+  docker compose up -d celery-worker
+  ```
+
+- **Check:** `GET http://localhost:8000/health` — `celery_training_ready` should be `true` and `celery_workers` non-empty when workers are connected to Redis.
+
+- **Local API without Docker:** start a worker in another terminal (same broker URL as in `.env`):
+
+  ```bash
+  cd backend && uv run celery -A app.tasks worker --loglevel=info -Q training,forecast,etl
+  ```
+
 ## Backend only (FastAPI)
 
 ```bash

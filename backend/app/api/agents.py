@@ -6,6 +6,7 @@ Provides both REST and WebSocket endpoints for chat interaction.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -18,6 +19,8 @@ from sqlalchemy.orm import selectinload
 from app.api.auth import get_current_user
 from app.db.models import ChatSession, Dataset as DatasetModel, User
 from app.db.session import get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -559,13 +562,19 @@ async def start_pipeline(
     db.add(model_run)
     await db.flush()
 
-    # TODO: dispatch Celery pipeline task
-    # from app.tasks.training import run_agent_pipeline
-    # run_agent_pipeline.delay(str(model_run.id))
+    try:
+        from app.tasks.training import run_agent_pipeline
+
+        run_agent_pipeline.delay(str(model_run.id))
+    except Exception as e:
+        logger.exception("Celery dispatch failed for pipeline model_run %s", model_run.id)
+        model_run.status = "failed"
+        model_run.error_message = f"Queue dispatch failed: {e}"[:2000]
+        await db.flush()
 
     return PipelineStatusResponse(
         model_run_id=model_run.id,
-        status="queued",
+        status=model_run.status,
         steps=[],
     )
 

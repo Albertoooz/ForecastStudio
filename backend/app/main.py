@@ -82,7 +82,26 @@ def create_app() -> FastAPI:
 
     @application.get("/health")
     async def health():
-        return {"status": "ok", "version": "0.1.0"}
+        """
+        Liveness probe. Includes Celery worker ping so you can see if training tasks
+        will stay stuck in `queued` (no workers consuming the `training` queue).
+        """
+        celery_workers: list[str] = []
+        try:
+            from app.tasks import celery_app
+
+            ping = celery_app.control.inspect(timeout=1.0).ping()
+            if ping:
+                celery_workers = list(ping.keys())
+        except Exception:
+            pass
+
+        return {
+            "status": "ok",
+            "version": "0.1.0",
+            "celery_workers": celery_workers,
+            "celery_training_ready": len(celery_workers) > 0,
+        }
 
     return application
 

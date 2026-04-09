@@ -145,6 +145,7 @@ services:
       --reload --reload-dir app
 
   # ── Celery Worker ──────────────────────────────────────────────────────
+  # Picks up training jobs from Redis. Without this, ModelRun stays "queued" forever.
   celery-worker:
     build:
       context: .
