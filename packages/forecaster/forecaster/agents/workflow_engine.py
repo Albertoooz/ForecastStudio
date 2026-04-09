@@ -12,6 +12,7 @@ Runs a complete pipeline autonomously:
 Reports progress via callback for live UI updates.
 """
 
+import math
 import sys
 import time
 from collections.abc import Callable
@@ -430,14 +431,42 @@ def run_forecast_workflow(
     t0 = time.time()
 
     try:
+
+        def _usable_rmse(rmse: object) -> bool:
+            if rmse is None or not isinstance(rmse, (int, float)):
+                return False
+            if isinstance(rmse, float) and (math.isnan(rmse) or math.isinf(rmse)):
+                return False
+            return rmse < 1e10
+
         best_name = None
         best_rmse = float("inf")
 
+        # Only consider models that actually finished training (artifact present).
         for name, res in model_results.items():
+            if trained_models.get(name) is None:
+                continue
             rmse = res.get("holdout_rmse")
-            if rmse is not None and isinstance(rmse, (int, float)) and rmse < best_rmse:
+            if _usable_rmse(rmse) and rmse < best_rmse:
                 best_rmse = rmse
                 best_name = name
+
+        # Fallback: any trained model by train order (e.g. all RMSE were inf but model exists)
+        if best_name is None:
+            for name in models_to_train:
+                if trained_models.get(name) is not None:
+                    best_name = name
+                    r = model_results.get(name, {}).get("holdout_rmse", 0)
+                    best_rmse = r if _usable_rmse(r) else float("inf")
+                    break
+
+        if best_name is None:
+            for name, mdl in trained_models.items():
+                if mdl is not None:
+                    best_name = name
+                    r = model_results.get(name, {}).get("holdout_rmse", 0)
+                    best_rmse = r if _usable_rmse(r) else float("inf")
+                    break
 
         if best_name is None:
             best_name = models_to_train[0] if models_to_train else "naive"
@@ -445,6 +474,12 @@ def run_forecast_workflow(
 
         result.best_model_name = best_name
         result.best_model = trained_models.get(best_name)
+
+        if result.best_model is None:
+            raise RuntimeError(
+                "No trained model is available (all training attempts failed or produced no artifact). "
+                "Expand the training step for error details."
+            )
 
         # Improvement vs naive
         naive_rmse = model_results.get("naive", {}).get("holdout_rmse")
